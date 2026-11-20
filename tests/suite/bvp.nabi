@@ -1,0 +1,86 @@
+use pkg::BvpStatus;
+use pkg::tests::suite::{close, expect, throws_kind};
+use core::array::{Array, Matrix, Vector};
+
+fn mesh(a: f64, b: f64, m: usize) -> Vector<f64> { Array::from(num::linspace(a, b, m)) }
+
+#[test]
+fn bratu_both_branches() {
+    // y'' + e^y = 0, y(0) = y(1) = 0: y = -2 ln(cosh((x - 1/2) th / 2) / cosh(th / 4)),
+    // th = sqrt(2) cosh(th / 4).
+    let f = |x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0].exp()] };
+    let bc = |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0], b[0]] };
+    let x = mesh(0.0, 1.0, 5);
+    for c in [(0.0, 1.5171645990508027), (3.0, 10.938702772122106)] {
+        let (guess, th) = c;
+        let y: Matrix<f64> = Array::full([2, 5], guess);
+        let r = try! pkg::solve_bvp(f, bc, x, y, tol: 1e-6, max_nodes: 5000);
+        expect(r.success(), f"Bratu from {guess}: {r.status}");
+        for i in 0..11 {
+            let s = 0.1 * (i as f64);
+            let exact = -2.0 * (((s - 0.5) * th / 2.0).cosh() / (th / 4.0).cosh()).ln();
+            close(r.sol.at(s)[0], exact, 1e-6 * exact.abs().max(1.0), f"Bratu ({guess}) at {s}");
+        }
+        for v in r.rms_residuals { expect(v <= 1e-6, "residuals within tol"); }
+    }
+}
+
+#[test]
+fn linear_bvp_closed_form() {
+    // y'' = y, y(0) = 0, y(1) = 1: y = sinh x / sinh 1.
+    let x = mesh(0.0, 1.0, 3);
+    let r = try! pkg::solve_bvp(|x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], y[0]] }, |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0], b[0] - 1.0] }, x, Array::zeros([2, 3]), tol: 1e-9);
+    expect(r.success(), "linear");
+    for j in 0..r.x.len() {
+        let s = r.x[j];
+        close(r.y[0, j], s.sinh() / 1.0f64.sinh(), 1e-9, "y at nodes");
+        close(r.yp[0, j], s.cosh() / 1.0f64.sinh(), 1e-8, "y' at nodes");
+    }
+    // A Neumann end: y'' = -y, y(0) = 1, y'(pi) = 0: y = cos x.
+    let pi = 3.141592653589793;
+    let n = try! pkg::solve_bvp(|x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0]] }, |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0] - 1.0, b[1]] }, mesh(0.0, pi, 4), Array::ones([2, 4]), tol: 1e-8);
+    close(n.sol.at(1.0)[0], 1.0f64.cos(), 1e-7, "Neumann");
+}
+
+#[test]
+fn coupled_conditions_take_the_dense_path() {
+    // y'' = -y + x with y(0) = y(1), y'(0) = y'(1): unique, y = x + c1 cos x + c2 sin x.
+    let x = mesh(0.0, 1.0, 5);
+    let r = try! pkg::solve_bvp(|x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0] + x] }, |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0] - b[0], a[1] - b[1]] }, x, Array::zeros([2, 5]), tol: 1e-9);
+    expect(r.success(), "periodic");
+    // c1 (1 - cos 1) - c2 sin 1 = 1, c1 sin 1 + c2 (1 - cos 1) = 0.
+    let (c, s) = (1.0f64.cos(), 1.0f64.sin());
+    let d = (1.0 - c) * (1.0 - c) + s * s;
+    let (c1, c2) = ((1.0 - c) / d, -s / d);
+    close(r.sol.at(0.4)[0], 0.4 + c1 * 0.4f64.cos() + c2 * 0.4f64.sin(), 1e-8, "periodic solution");
+}
+
+#[test]
+fn eigenvalue_parameter() {
+    // y'' + l y = 0, y(0) = y(1) = 0, y'(0) = 1: the second eigenvalue (2 pi)^2.
+    let x = mesh(0.0, 1.0, 9);
+    let y: Matrix<f64> = Array::from_fn([2, 9], |ix: [usize; 2]| -> f64 {
+        let s = (ix[1] as f64) / 8.0;
+        if ix[0] == 0 { (6.283 * s).sin() / 6.283 } else { (6.283 * s).cos() }
+    });
+    let p0: Vector<f64> = [35.0];
+    let r = try! pkg::solve_bvp_params(|x: f64, y: Vector<f64>, p: Vector<f64>| -> Vector<f64> { [y[1], -p[0] * y[0]] }, |a: Vector<f64>, b: Vector<f64>, p: Vector<f64>| -> Vector<f64> { [a[0], b[0], a[1] - 1.0] }, x, y, p0, tol: 1e-8);
+    expect(r.success(), f"eigenvalue: {r.status}");
+    close(r.p[0], 39.47841760435743, 1e-6, "(2 pi)^2");
+}
+
+#[test]
+fn bvp_status_and_errors() {
+    // Too few nodes allowed.
+    let f = |x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0].exp()] };
+    let bc = |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0], b[0]] };
+    let r = try! pkg::solve_bvp(f, bc, mesh(0.0, 1.0, 5), Array::full([2, 5], 3.0), tol: 1e-8, max_nodes: 20);
+    expect(r.status == BvpStatus::MaxNodes && !r.success(), f"max_nodes: {r.status:?}");
+    // A degenerate problem: both conditions on y(0).
+    let s = try! pkg::solve_bvp(|x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0]] }, |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0], 2.0 * a[0]] }, mesh(0.0, 1.0, 5), Array::zeros([2, 5]));
+    expect(s.status == BvpStatus::Singular, f"singular: {s.status:?}");
+    expect(throws_kind(|| { _ = try pkg::solve_bvp(f, bc, Vector::<f64>::from([0.0, 1.0, 0.5]), Array::zeros([2, 3])); }, "BadArgument"), "unsorted mesh");
+    expect(throws_kind(|| { _ = try pkg::solve_bvp(f, bc, mesh(0.0, 1.0, 4), Array::zeros([2, 3])); }, "LengthMismatch"), "guess shape");
+    expect(throws_kind(|| { _ = try pkg::solve_bvp(f, |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0]] }, mesh(0.0, 1.0, 4), Array::zeros([2, 4])); }, "LengthMismatch"), "bc count");
+    expect(throws_kind(|| { _ = try pkg::solve_bvp(f, bc, Vector::<f64>::from([0.0]), Array::zeros([2, 1])); }, "BadArgument"), "one node");
+}

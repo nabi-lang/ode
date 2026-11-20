@@ -1,0 +1,693 @@
+// Two-point boundary value problems y' = f(x, y, p), bc(y(a), y(b), p)
+// = 0 by the 4th order collocation of Kierzenka and Shampine (A BVP
+// solver based on residual control and the MATLAB PSE, 2001), as SciPy's
+// `solve_bvp`: the solution is a C1 cubic spline whose residual vanishes
+// at the nodes and midpoints (Lobatto IIIA). The collocation equations
+// are solved by a damped Newton method with an affine-invariant
+// Armijo test, reusing the Jacobian after full steps; the mesh is then
+// refined where the RMS of the relative residual, by 5-point Lobatto
+// quadrature, exceeds `tol` (one node added, two above 100 tol).
+// Jacobians are by forward differences. With separated boundary
+// conditions and no parameters the Newton system is banded and solved
+// in O(m n^3); otherwise it is dense, O((m n)^3).
+
+pub(pkg) mod band;
+
+use pkg::OdeError;
+use pkg::bvp::band::Band;
+use pkg::dense::{Dense, Piece};
+use core::array::{Array, Matrix, Vector};
+use linalg::{AsVector, Lu};
+
+const SQRT_EPS: f64 = 1.4901161193847656e-8;
+const MAX_ITERATION: usize = 10;
+
+/// How `solve_bvp` ended.
+///
+/// ```nabi
+/// use ode::BvpStatus;
+///
+/// assert(BvpStatus::Converged.success() && !BvpStatus::MaxNodes.success());
+/// assert(f"{BvpStatus::MaxNodes}".contains("max_nodes"));
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BvpStatus {
+    /// The residuals and boundary conditions meet their tolerances.
+    Converged,
+    /// Refining the mesh further would pass `max_nodes`.
+    MaxNodes,
+    /// The Newton system was singular.
+    Singular,
+    /// The residual is small but the boundary conditions miss `bc_tol`
+    /// after 10 iterations.
+    BcTolerance,
+}
+
+impl BvpStatus {
+    /// Whether the tolerances were met.
+    ///
+    /// ```nabi
+    /// assert(ode::BvpStatus::Converged.success());
+    /// ```
+    pub fn success(self) -> bool { self == BvpStatus::Converged }
+}
+
+impl Display for BvpStatus {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            BvpStatus::Converged => "converged",
+            BvpStatus::MaxNodes => "the mesh would need more than max_nodes nodes; raise `max_nodes`, loosen `tol`, or start from a better guess",
+            BvpStatus::Singular => "the collocation system is singular; check the boundary conditions (n + k independent ones) and start from a guess that is not degenerate",
+            BvpStatus::BcTolerance => "the boundary conditions miss bc_tol; loosen `bc_tol` or rescale the problem",
+        };
+        try f.write_str(s)
+    }
+}
+
+/// The result of `solve_bvp`.
+///
+/// `sol` is the C1 cubic spline (`sol.at(x)`), `x` the final mesh, `y`
+/// and `yp` the solution and its derivative there (`[n, x.len()]`), `p`
+/// the fitted parameters, `rms_residuals` the relative residual per
+/// interval.
+///
+/// ```nabi
+/// use core::array::{Array, Matrix, Vector};
+///
+/// // y'' = -y, y(0) = 0, y(pi / 2) = 1: y = sin x.
+/// let x: Vector<f64> = [0.0, 0.5, 1.0, 1.5707963267948966];
+/// let y: Matrix<f64> = Array::zeros([2, 4]);
+/// let r = try ode::solve_bvp(|x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0]] }, |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0], b[0] - 1.0] }, x, y, tol: 1e-6);
+/// assert(r.success() && (r.sol.at(1.0)[0] - 1.0f64.sin()).abs() < 1e-6);
+/// ```
+#[derive(Clone)]
+pub struct Bvp {
+    /// The spline solution.
+    pub sol: Dense;
+    /// The final mesh.
+    pub x: Vector<f64>;
+    /// The solution at the mesh, `[n, m]`.
+    pub y: Matrix<f64>;
+    /// `f(x, y, p)` at the mesh, `[n, m]`.
+    pub yp: Matrix<f64>;
+    /// The parameters (empty without any).
+    pub p: Vector<f64>;
+    /// RMS relative residual per interval.
+    pub rms_residuals: Vector<f64>;
+    /// Newton / refinement rounds.
+    pub iterations: usize;
+    /// How it ended.
+    pub status: BvpStatus;
+    /// Evaluations of `f`.
+    pub nfev: usize;
+}
+
+impl Bvp {
+    /// Whether the tolerances were met (`status.success()`).
+    ///
+    /// ```nabi
+    /// use core::array::{Array, Vector};
+    ///
+    /// let x: Vector<f64> = [0.0, 1.0];
+    /// let r = try ode::solve_bvp(|x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], 0.0] }, |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0], b[0] - 2.0] }, x, Array::zeros([2, 2]));
+    /// assert(r.success() && (r.sol.at(0.25)[0] - 0.5).abs() < 1e-12);
+    /// ```
+    pub fn success(self) -> bool { self.status.success() }
+}
+
+struct Prob {
+    f: fn(f64, Vector<f64>, Vector<f64>) -> Vector<f64>;
+    bc: fn(Vector<f64>, Vector<f64>, Vector<f64>) -> Vector<f64>;
+    n: usize;
+    k: usize;
+    nfev: usize;
+}
+
+impl Prob {
+    fn rhs(ref self, x: f64, y: List<f64>, p: List<f64>) throws (OdeError) -> List<f64> {
+        self.nfev += 1;
+        let v = (self.f)(x, Array::view_list(y, [self.n]), Array::view_list(p, [self.k]));
+        if v.len() != self.n { throw OdeError::LengthMismatch { what: f"f(x, y) returned {v.len()} values for {self.n} unknowns; return one derivative per component of y" }; }
+        match v.as_list() {
+            xs: List<f64> => xs,
+            none => v.to_list(),
+        }
+    }
+
+    fn bcv(self, ya: List<f64>, yb: List<f64>, p: List<f64>) throws (OdeError) -> List<f64> {
+        let (n, k) = (self.n, self.k);
+        let v = (self.bc)(Array::view_list(ya, [n]), Array::view_list(yb, [n]), Array::view_list(p, [k]));
+        if v.len() != n + k { throw OdeError::LengthMismatch { what: f"bc(ya, yb) returned {v.len()} residuals; return n + k = {n + k} (one per unknown and per parameter)" }; }
+        match v.as_list() {
+            xs: List<f64> => xs,
+            none => v.to_list(),
+        }
+    }
+
+    /// `df/dy` (`n x n`) and `df/dp` (`n x k`) at `(x, y)`, row-major.
+    fn jac(ref self, x: f64, y: List<f64>, p: List<f64>, f0: List<f64>) throws (OdeError) -> (List<f64>, List<f64>) {
+        let (n, k) = (self.n, self.k);
+        let a = List::filled(n * n, 0.0);
+        for j in 0..n {
+            let yj = y.clone();
+            yj[j] = y[j] + SQRT_EPS * (1.0 + y[j].abs());
+            let h = yj[j] - y[j];
+            let fj = try self.rhs(x, yj, p);
+            for i in 0..n { a[i * n + j] = (fj[i] - f0[i]) / h; }
+        }
+        let b = List::filled(n * k, 0.0);
+        for j in 0..k {
+            let pj = p.clone();
+            pj[j] = p[j] + SQRT_EPS * (1.0 + p[j].abs());
+            let h = pj[j] - p[j];
+            let fj = try self.rhs(x, y, pj);
+            for i in 0..n { b[i * k + j] = (fj[i] - f0[i]) / h; }
+        }
+        (a, b)
+    }
+}
+
+/// The collocation residuals of a mesh.
+struct Col {
+    res: List<f64>;
+    f: List<f64>;
+    fmid: List<f64>;
+    ymid: List<f64>;
+}
+
+fn node(y: List<f64>, j: usize, n: usize) -> List<f64> {
+    let v = List::filled(n, 0.0);
+    for i in 0..n { v[i] = y[j * n + i]; }
+    v
+}
+
+fn collocation(ref pr: Prob, x: List<f64>, y: List<f64>, p: List<f64>) throws (OdeError) -> Col {
+    let n = pr.n;
+    let m = x.len();
+    let f = List::filled(m * n, 0.0);
+    for j in 0..m {
+        let fj = try pr.rhs(x[j], node(y, j, n), p);
+        for i in 0..n { f[j * n + i] = fj[i]; }
+    }
+    let ymid = List::filled((m - 1) * n, 0.0);
+    let fmid = List::filled((m - 1) * n, 0.0);
+    let res = List::filled((m - 1) * n, 0.0);
+    for j in 0..m - 1 {
+        let h = x[j + 1] - x[j];
+        let ym = List::filled(n, 0.0);
+        for i in 0..n {
+            let (a, b) = (j * n + i, (j + 1) * n + i);
+            ym[i] = 0.5 * (y[b] + y[a]) - 0.125 * h * (f[b] - f[a]);
+            ymid[a] = ym[i];
+        }
+        let fm = try pr.rhs(x[j] + 0.5 * h, ym, p);
+        for i in 0..n {
+            let (a, b) = (j * n + i, (j + 1) * n + i);
+            fmid[a] = fm[i];
+            res[a] = y[b] - y[a] - h / 6.0 * (f[a] + f[b] + 4.0 * fm[i]);
+        }
+    }
+    Col { res: res, f: f, fmid: fmid, ymid: ymid }
+}
+
+/// The factored Newton matrix.
+struct Newton {
+    banded: bool;
+    band: Band;
+    lu: Lu<f64> | none;
+    /// Band row `r` holds residual `order[r]`.
+    order: List<usize>;
+    singular: bool;
+}
+
+impl Newton {
+    fn solve(self, r: List<f64>) -> List<f64> {
+        if self.banded {
+            let b = List::filled(r.len(), 0.0);
+            for i in 0..r.len() { b[i] = r[self.order[i]]; }
+            return self.band.solve(b);
+        }
+        match self.lu {
+            lu: Lu<f64> => {
+                let x = try lu.solve(Array::view_list(r, [r.len()])) catch _ { return List::filled(r.len(), f64::NAN); };
+                x.to_list()
+            },
+            none => List::filled(r.len(), f64::NAN),
+        }
+    }
+}
+
+/// The Jacobian of the collocation system, factored.
+fn newton_matrix(ref pr: Prob, x: List<f64>, y: List<f64>, p: List<f64>, col: Col) throws (OdeError) -> Newton {
+    let (n, k) = (pr.n, pr.k);
+    let m = x.len();
+    let nn = n * m + k;
+    let a_nodes: List<List<f64>> = [];
+    let p_nodes: List<List<f64>> = [];
+    for j in 0..m {
+        let (a, b) = try pr.jac(x[j], node(y, j, n), p, node(col.f, j, n));
+        a_nodes.push(a);
+        p_nodes.push(b);
+    }
+    let a_mid: List<List<f64>> = [];
+    let p_mid: List<List<f64>> = [];
+    for j in 0..m - 1 {
+        let h = x[j + 1] - x[j];
+        let (a, b) = try pr.jac(x[j] + 0.5 * h, node(col.ymid, j, n), p, node(col.fmid, j, n));
+        a_mid.push(a);
+        p_mid.push(b);
+    }
+    // Boundary-condition Jacobian: (n + k) rows over ya, yb, p.
+    let nb = n + k;
+    let ya = node(y, 0, n);
+    let yb = node(y, m - 1, n);
+    let b0 = try pr.bcv(ya, yb, p);
+    let (da, db, dp) = (List::filled(nb * n, 0.0), List::filled(nb * n, 0.0), List::filled(nb * k, 0.0));
+    for j in 0..n {
+        let v = ya.clone();
+        v[j] = ya[j] + SQRT_EPS * (1.0 + ya[j].abs());
+        let h = v[j] - ya[j];
+        let b1 = try pr.bcv(v, yb, p);
+        for i in 0..nb { da[i * n + j] = (b1[i] - b0[i]) / h; }
+        let w = yb.clone();
+        w[j] = yb[j] + SQRT_EPS * (1.0 + yb[j].abs());
+        let g = w[j] - yb[j];
+        let b2 = try pr.bcv(ya, w, p);
+        for i in 0..nb { db[i * n + j] = (b2[i] - b0[i]) / g; }
+    }
+    for j in 0..k {
+        let v = p.clone();
+        v[j] = p[j] + SQRT_EPS * (1.0 + p[j].abs());
+        let h = v[j] - p[j];
+        let b1 = try pr.bcv(ya, yb, v);
+        for i in 0..nb { dp[i * k + j] = (b1[i] - b0[i]) / h; }
+    }
+    // Separated conditions: each row touches only ya or only yb.
+    let only_a: List<usize> = [];
+    let only_b: List<usize> = [];
+    let separated = k == 0;
+    for i in 0..nb {
+        let (za, zb) = (true, true);
+        for j in 0..n {
+            if da[i * n + j] != 0.0 { za = false; }
+            if db[i * n + j] != 0.0 { zb = false; }
+        }
+        if zb && !za { only_a.push(i); } else if za { only_b.push(i); } else { separated = false; }
+    }
+    // Block of interval j against y_j (`lo`) and y_{j+1} (`hi`).
+    let blocks = |j: usize| -> (List<f64>, List<f64>) {
+        let h = x[j + 1] - x[j];
+        let (aj, aj1, am) = (a_nodes[j], a_nodes[j + 1], a_mid[j]);
+        let lo = List::filled(n * n, 0.0);
+        let hi = List::filled(n * n, 0.0);
+        for r in 0..n {
+            for c in 0..n {
+                let (t0, t1) = (0.0, 0.0);
+                for l in 0..n {
+                    t0 += am[r * n + l] * aj[l * n + c];
+                    t1 += am[r * n + l] * aj1[l * n + c];
+                }
+                let e = if r == c { 1.0 } else { 0.0 };
+                lo[r * n + c] = -e - h / 6.0 * (aj[r * n + c] + 2.0 * am[r * n + c]) - h * h / 12.0 * t0;
+                hi[r * n + c] = e - h / 6.0 * (aj1[r * n + c] + 2.0 * am[r * n + c]) + h * h / 12.0 * t1;
+            }
+        }
+        (lo, hi)
+    };
+    if separated {
+        let na = only_a.len();
+        let kl = na + n - 1;
+        let ku = 2 * n - 1 - na;
+        let band = Band::zeros(nn, kl, ku);
+        let order = List::filled(nn, 0usize);
+        for r in 0..na {
+            let i = only_a[r];
+            order[r] = n * (m - 1) + i;
+            for c in 0..n { band.add(r, c, da[i * n + c]); }
+        }
+        for j in 0..m - 1 {
+            let (lo, hi) = blocks(j);
+            for r in 0..n {
+                let row = na + j * n + r;
+                order[row] = j * n + r;
+                for c in 0..n {
+                    band.add(row, j * n + c, lo[r * n + c]);
+                    band.add(row, (j + 1) * n + c, hi[r * n + c]);
+                }
+            }
+        }
+        for r in 0..only_b.len() {
+            let i = only_b[r];
+            let row = na + (m - 1) * n + r;
+            order[row] = n * (m - 1) + i;
+            for c in 0..n { band.add(row, (m - 1) * n + c, db[i * n + c]); }
+        }
+        band.factor();
+        return Newton { banded: true, band: band, lu: none, order: order, singular: band.singular };
+    }
+    let d = List::filled(nn * nn, 0.0);
+    for j in 0..m - 1 {
+        let h = x[j + 1] - x[j];
+        let (lo, hi) = blocks(j);
+        for r in 0..n {
+            let row = j * n + r;
+            for c in 0..n {
+                d[row * nn + j * n + c] = lo[r * n + c];
+                d[row * nn + (j + 1) * n + c] = hi[r * n + c];
+            }
+        }
+        if k > 0 {
+            let (pj, pj1, pm, am) = (p_nodes[j], p_nodes[j + 1], p_mid[j], a_mid[j]);
+            for r in 0..n {
+                for c in 0..k {
+                    // df/dp at the midpoint through y_mid's dependence on p.
+                    let t = 0.0;
+                    for l in 0..n { t += am[r * n + l] * (pj[l * k + c] - pj1[l * k + c]); }
+                    let pmid = pm[r * k + c] + 0.125 * h * t;
+                    d[(j * n + r) * nn + n * m + c] = -h / 6.0 * (pj[r * k + c] + pj1[r * k + c] + 4.0 * pmid);
+                }
+            }
+        }
+    }
+    for i in 0..nb {
+        let row = n * (m - 1) + i;
+        for c in 0..n {
+            d[row * nn + c] += da[i * n + c];
+            d[row * nn + (m - 1) * n + c] += db[i * n + c];
+        }
+        for c in 0..k { d[row * nn + n * m + c] = dp[i * k + c]; }
+    }
+    let lu = try linalg::lu(Array::view_list(d, [nn, nn])) catch _ { return Newton { banded: false, band: Band::zeros(0, 0, 0), lu: none, order: [], singular: true }; };
+    let sing = try {
+        _ = try lu.solve(Array::view_list(List::filled(nn, 0.0), [nn]));
+        false
+    } catch _ { true };
+    Newton { banded: false, band: Band::zeros(0, 0, 0), lu: lu, order: [], singular: sing }
+}
+
+fn residual(col: Col, b: List<f64>) -> List<f64> {
+    let r = col.res.clone();
+    for v in b { r.push(v); }
+    r
+}
+
+fn dot(a: List<f64>) -> f64 {
+    let s = 0.0;
+    for v in a { s += v * v; }
+    s
+}
+
+/// Damped Newton on the collocation system (SciPy's `solve_newton`).
+/// Returns (y, p, singular).
+fn newton(ref pr: Prob, x: List<f64>, y: List<f64>, p: List<f64>, tol: f64, bc_tol: f64) throws (OdeError) -> (List<f64>, List<f64>, bool) {
+    let (n, k) = (pr.n, pr.k);
+    let m = x.len();
+    let max_njev = 4;
+    let max_iter = 8;
+    let (sigma, tau, n_trial) = (0.2, 0.5, 4);
+    let col = try collocation(ref pr, x, y, p);
+    let bres = try pr.bcv(node(y, 0, n), node(y, m - 1, n), p);
+    let res = residual(col, bres);
+    let njev = 0;
+    let recompute = true;
+    let jm = Newton { banded: false, band: Band::zeros(0, 0, 0), lu: none, order: [], singular: true };
+    let step: List<f64> = [];
+    let cost = 0.0;
+    for _ in 0..max_iter {
+        if recompute {
+            jm = try newton_matrix(ref pr, x, y, p, col);
+            njev += 1;
+            if jm.singular { return (y, p, true); }
+            step = jm.solve(res);
+            cost = dot(step);
+        }
+        let alpha = 1.0;
+        let y_new = y;
+        let p_new = p;
+        let step_new: List<f64> = [];
+        let cost_new = 0.0;
+        for trial in 0..n_trial + 1 {
+            y_new = List::filled(m * n, 0.0);
+            for i in 0..m * n { y_new[i] = y[i] - alpha * step[i]; }
+            p_new = List::filled(k, 0.0);
+            for i in 0..k { p_new[i] = p[i] - alpha * step[m * n + i]; }
+            col = try collocation(ref pr, x, y_new, p_new);
+            bres = try pr.bcv(node(y_new, 0, n), node(y_new, m - 1, n), p_new);
+            res = residual(col, bres);
+            step_new = jm.solve(res);
+            cost_new = dot(step_new);
+            if cost_new < (1.0 - 2.0 * alpha * sigma) * cost { break; }
+            if trial < n_trial { alpha *= tau; }
+        }
+        y = y_new;
+        p = p_new;
+        if njev == max_njev { break; }
+        let done = true;
+        for j in 0..m - 1 {
+            let tol_r = 2.0 / 3.0 * (x[j + 1] - x[j]) * 5e-2 * tol;
+            for i in 0..n {
+                let a = j * n + i;
+                if !(col.res[a].abs() < tol_r * (1.0 + col.fmid[a].abs())) { done = false; }
+            }
+        }
+        for v in bres {
+            if !(v.abs() < bc_tol) { done = false; }
+        }
+        if done { break; }
+        if alpha == 1.0 {
+            step = step_new;
+            cost = cost_new;
+            recompute = false;
+        } else {
+            recompute = true;
+        }
+    }
+    (y, p, false)
+}
+
+/// Cubic Hermite coefficients of interval `j` in `x - x_j`: (c1, c2, c3)
+/// per component (`c0 = y_j`).
+fn cubic(x: List<f64>, y: List<f64>, yp: List<f64>, n: usize, j: usize) -> List<f64> {
+    let h = x[j + 1] - x[j];
+    let c = List::filled(3 * n, 0.0);
+    for i in 0..n {
+        let (a, b) = (j * n + i, (j + 1) * n + i);
+        let slope = (y[b] - y[a]) / h;
+        let t = (yp[a] + yp[b] - 2.0 * slope) / h;
+        c[3 * i] = yp[a];
+        c[3 * i + 1] = (slope - yp[a]) / h - t;
+        c[3 * i + 2] = t / h;
+    }
+    c
+}
+
+/// Value and derivative of the spline of interval `j` at `s = x - x_j`.
+fn spline_at(y: List<f64>, c: List<f64>, n: usize, j: usize, s: f64) -> (List<f64>, List<f64>) {
+    let (v, d) = (List::filled(n, 0.0), List::filled(n, 0.0));
+    for i in 0..n {
+        let (c1, c2, c3) = (c[3 * i], c[3 * i + 1], c[3 * i + 2]);
+        v[i] = y[j * n + i] + s * (c1 + s * (c2 + s * c3));
+        d[i] = c1 + s * (2.0 * c2 + 3.0 * s * c3);
+    }
+    (v, d)
+}
+
+/// Sum over components of `(r / (1 + |f|))^2`.
+fn rel2(r: List<f64>, f: List<f64>) -> f64 {
+    let s = 0.0;
+    for i in 0..r.len() {
+        let v = r[i] / (1.0 + f[i].abs());
+        s += v * v;
+    }
+    s
+}
+
+/// Solves `y' = f(x, y)` with `bc(y(a), y(b)) = 0` (`n` conditions) on
+/// the mesh `x` (rising, at least 2 nodes), from the guess `y`
+/// (`[n, x.len()]`). `tol` bounds the RMS relative residual, `bc_tol`
+/// (`tol` when left 0) the boundary residuals.
+///
+/// ```nabi
+/// use core::array::{Array, Matrix, Vector};
+///
+/// // Bratu's problem y'' + e^y = 0, y(0) = y(1) = 0 (the lower branch).
+/// let x: Vector<f64> = [0.0, 0.25, 0.5, 0.75, 1.0];
+/// let y: Matrix<f64> = Array::zeros([2, 5]);
+/// let r = try ode::solve_bvp(|x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0].exp()] }, |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0], b[0]] }, x, y, tol: 1e-8);
+/// assert(r.success() && (r.sol.at(0.5)[0] - 0.1405392144).abs() < 1e-8);
+/// ```
+pub fn solve_bvp<X: AsVector<f64>>(
+    f: fn(f64, Vector<f64>) -> Vector<f64>,
+    bc: fn(Vector<f64>, Vector<f64>) -> Vector<f64>,
+    x: X,
+    y: Matrix<f64>,
+    tol: f64 = 1e-3,
+    max_nodes: usize = 1000,
+    bc_tol: f64 = 0.0,
+) throws (OdeError) -> Bvp {
+    let x: Vector<f64> = x.as_vector();
+    let p: Vector<f64> = Array::zeros([0]);
+    try solve_bvp_params(|x: f64, y: Vector<f64>, _p: Vector<f64>| -> Vector<f64> { f(x, y) }, |a: Vector<f64>, b: Vector<f64>, _p: Vector<f64>| -> Vector<f64> { bc(a, b) }, x, y, p, tol: tol, max_nodes: max_nodes, bc_tol: bc_tol)
+}
+
+/// `solve_bvp` with unknown parameters `p` (`k` of them, from the guess
+/// `p`): `f(x, y, p)` and `n + k` boundary conditions `bc(ya, yb, p)`,
+/// as for eigenvalue problems. Always takes the dense Newton path.
+///
+/// ```nabi
+/// use core::array::{Array, Matrix, Vector};
+///
+/// // y'' + k^2 y = 0, y(0) = y(1) = 0, y'(0) = k: the first eigenvalue is k = pi.
+/// let x: Vector<f64> = [0.0, 0.25, 0.5, 0.75, 1.0];
+/// let y: Matrix<f64> = [[0.0, 0.7, 1.0, 0.7, 0.0], [3.0, 2.0, 0.0, -2.0, -3.0]];
+/// let p0: Vector<f64> = [3.0];
+/// let r = try ode::solve_bvp_params(
+///     |x: f64, y: Vector<f64>, p: Vector<f64>| -> Vector<f64> { [y[1], -p[0] * p[0] * y[0]] },
+///     |a: Vector<f64>, b: Vector<f64>, p: Vector<f64>| -> Vector<f64> { [a[0], b[0], a[1] - p[0]] },
+///     x, y, p0, tol: 1e-8);
+/// assert(r.success() && (r.p[0] - 3.141592653589793).abs() < 1e-6);
+/// ```
+pub fn solve_bvp_params<X: AsVector<f64>, P: AsVector<f64>>(
+    f: fn(f64, Vector<f64>, Vector<f64>) -> Vector<f64>,
+    bc: fn(Vector<f64>, Vector<f64>, Vector<f64>) -> Vector<f64>,
+    x: X,
+    y: Matrix<f64>,
+    p: P,
+    tol: f64 = 1e-3,
+    max_nodes: usize = 1000,
+    bc_tol: f64 = 0.0,
+) throws (OdeError) -> Bvp {
+    let x: Vector<f64> = x.as_vector();
+    let p: Vector<f64> = p.as_vector();
+    let m = x.len();
+    let s = y.shape();
+    let n = s[0];
+    let k = p.len();
+    if m < 2 { throw OdeError::BadArgument { what: f"the mesh needs at least 2 nodes, got {m}; pass the interval ends at least, such as `[0.0, 1.0]`" }; }
+    if s[1] != m { throw OdeError::LengthMismatch { what: f"y is {n} x {s[1]} for a mesh of {m} nodes; pass the guess as one column per node, shape [n, x.len()]" }; }
+    if n == 0 { throw OdeError::BadArgument { what: "the system has no unknowns; y needs at least one row" }; }
+    let xs = x.to_list();
+    for j in 0..m {
+        if !xs[j].is_finite() { throw OdeError::NotFinite { what: "x" }; }
+        if j > 0 && !(xs[j] > xs[j - 1]) { throw OdeError::BadArgument { what: f"the mesh must rise strictly, but x[{j}] = {xs[j]} <= x[{j - 1}]; sort it and drop repeated nodes" }; }
+    }
+    if !(tol > 0.0) { throw OdeError::BadArgument { what: f"tol must be positive, got {tol}; pass a residual tolerance such as `tol: 1e-6`" }; }
+    let tol = tol.max(100.0 * f64::EPSILON);
+    let bc_tol = if bc_tol > 0.0 { bc_tol } else { tol };
+    if max_nodes < m { throw OdeError::BadArgument { what: f"max_nodes ({max_nodes}) is below the {m} nodes of the initial mesh; raise it" }; }
+    // Node-major copy of the guess.
+    let yl = List::filled(m * n, 0.0);
+    for j in 0..m {
+        for i in 0..n {
+            let v = y[i, j];
+            if !v.is_finite() { throw OdeError::NotFinite { what: "y (the initial guess)" }; }
+            yl[j * n + i] = v;
+        }
+    }
+    let pl = p.to_list();
+    let pr = Prob { f: f, bc: bc, n: n, k: k, nfev: 0 };
+    let b0 = try pr.bcv(node(yl, 0, n), node(yl, m - 1, n), pl);
+    _ = b0;
+    let status = BvpStatus::Converged;
+    let iteration = 0usize;
+    let col = try collocation(ref pr, xs, yl, pl);
+    let rms: List<f64> = [];
+    loop {
+        let (y2, p2, singular) = try newton(ref pr, xs, yl, pl, tol, bc_tol);
+        yl = y2;
+        pl = p2;
+        iteration += 1;
+        m = xs.len();
+        col = try collocation(ref pr, xs, yl, pl);
+        let bres = try pr.bcv(node(yl, 0, n), node(yl, m - 1, n), pl);
+        let max_bc = 0.0;
+        for v in bres { max_bc = max_bc.max(v.abs()); }
+        // RMS relative residual per interval: 5-point Lobatto
+        // quadrature of |y' - f|^2 / (1 + |f|)^2 (Kierzenka-Shampine).
+        rms = List::filled(m - 1, 0.0);
+        let w = (3.0f64 / 7.0).sqrt();
+        for j in 0..m - 1 {
+            let h = xs[j + 1] - xs[j];
+            let c = cubic(xs, yl, col.f, n, j);
+            let (_, dm) = spline_at(yl, c, n, j, 0.5 * h);
+            let rm = List::filled(n, 0.0);
+            let fm = node(col.fmid, j, n);
+            for i in 0..n { rm[i] = dm[i] - fm[i]; }
+            let total = 32.0 / 45.0 * rel2(rm, fm);
+            for side in [-1.0, 1.0] {
+                let s = 0.5 * h * (1.0 + side * w);
+                let (v, d) = spline_at(yl, c, n, j, s);
+                let fv = try pr.rhs(xs[j] + s, v, pl);
+                let r = List::filled(n, 0.0);
+                for i in 0..n { r[i] = d[i] - fv[i]; }
+                total += 49.0 / 90.0 * rel2(r, fv);
+            }
+            rms[j] = (0.5 * total).sqrt();
+        }
+        if singular {
+            status = BvpStatus::Singular;
+            break;
+        }
+        let (one, two) = (0usize, 0usize);
+        for v in rms {
+            if v >= 100.0 * tol { two += 1; } else if v > tol { one += 1; }
+        }
+        let added = one + 2 * two;
+        if m + added > max_nodes {
+            status = BvpStatus::MaxNodes;
+            break;
+        }
+        if added > 0 {
+            let nx: List<f64> = [];
+            let ny: List<f64> = [];
+            for j in 0..m - 1 {
+                let h = xs[j + 1] - xs[j];
+                let c = cubic(xs, yl, col.f, n, j);
+                nx.push(xs[j]);
+                for i in 0..n { ny.push(yl[j * n + i]); }
+                let parts = if rms[j] >= 100.0 * tol { 3 } else if rms[j] > tol { 2 } else { 1 };
+                for q in 1..parts {
+                    let s = h * (q as f64) / (parts as f64);
+                    nx.push(xs[j] + s);
+                    let (v, _) = spline_at(yl, c, n, j, s);
+                    for i in 0..n { ny.push(v[i]); }
+                }
+            }
+            nx.push(xs[m - 1]);
+            for i in 0..n { ny.push(yl[(m - 1) * n + i]); }
+            xs = nx;
+            yl = ny;
+        } else if max_bc <= bc_tol {
+            status = BvpStatus::Converged;
+            break;
+        } else if iteration >= MAX_ITERATION {
+            status = BvpStatus::BcTolerance;
+            break;
+        }
+    }
+    m = xs.len();
+    let dense = Dense::new(xs[0], node(yl, 0, n));
+    for j in 0..m - 1 {
+        let h = xs[j + 1] - xs[j];
+        let c = cubic(xs, yl, col.f, n, j);
+        let q = List::filled(3 * n, 0.0);
+        for i in 0..n {
+            q[3 * i] = h * c[3 * i];
+            q[3 * i + 1] = h * h * c[3 * i + 1];
+            q[3 * i + 2] = h * h * h * c[3 * i + 2];
+        }
+        dense.push(xs[j + 1], Piece::Poly { t0: xs[j], h: h, y0: node(yl, j, n), q: q, k: 3 });
+    }
+    let (yd, fd) = (List::filled(n * m, 0.0), List::filled(n * m, 0.0));
+    for j in 0..m {
+        for i in 0..n {
+            yd[i * m + j] = yl[j * n + i];
+            fd[i * m + j] = col.f[j * n + i];
+        }
+    }
+    Bvp {
+        sol: dense, x: Array::from_list(xs, [m]), y: Array::view_list(yd, [n, m]), yp: Array::view_list(fd, [n, m]),
+        p: Array::from_list(pl, [k]), rms_residuals: Array::from_list(rms, [rms.len()]),
+        iterations: iteration, status: status, nfev: pr.nfev,
+    }
+}

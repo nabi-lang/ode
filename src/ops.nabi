@@ -1,0 +1,190 @@
+//! Flows: one-step maps phi_h composed the way splitting and composition
+//! methods are written (Hairer, Lubich and Wanner, Geometric Numerical
+//! Integration, II.4-5), behind the `ops` feature:
+//!
+//!   a ∘ b     a after b (core's `∘`)
+//!   c * a     the same map with step c h
+//!   a ** n    n steps of a
+//!   a ⊳ y     a applied to the state y (binds like `*`)
+//!
+//! so Strang splitting is `(0.5 * a) ∘ b ∘ (0.5 * a)` and a step of
+//! Yoshida's method `(w1 * v) ∘ (w0 * v) ∘ (w1 * v)`.
+
+use pkg::Fixed;
+use core::array::{Array, Vector};
+
+/// A one-step map `y -> phi_h(y)` with its step `h` built in.
+///
+/// ```nabi
+/// use ode::ops::{Advance, Flow};
+/// use core::array::Vector;
+///
+/// // Exact flow of y' = -y and its splitting into halves.
+/// let decay = Flow::new(|h: f64, y: Vector<f64>| -> Vector<f64> { y .* (-h).exp() }, 0.1);
+/// assert(((decay ** 10 ⊳ [1.0])[0] - (-1.0f64).exp()).abs() < 1e-15);
+/// assert((((0.5 * decay) ∘ (0.5 * decay) ⊳ [1.0])[0] - (decay ⊳ [1.0])[0]).abs() < 1e-15);
+/// ```
+pub struct Flow {
+    /// `map(s, y)` is the step of size `s h`.
+    map: fn(f64, Vector<f64>) -> Vector<f64>;
+}
+
+impl Flow {
+    /// The flow `y -> map(h, y)`.
+    ///
+    /// ```nabi
+    /// use ode::ops::{Advance, Flow};
+    /// use core::array::Vector;
+    ///
+    /// let euler = Flow::new(|h: f64, y: Vector<f64>| -> Vector<f64> { y .+ y .* h }, 0.5);
+    /// assert((euler ⊳ [2.0])[0] == 3.0);
+    /// ```
+    pub fn new(map: fn(f64, Vector<f64>) -> Vector<f64>, h: f64) -> Flow {
+        Flow { map: |s: f64, y: Vector<f64>| -> Vector<f64> { map(s * h, y) } }
+    }
+
+    /// One step of `method` for the autonomous `y' = f(y)`.
+    ///
+    /// ```nabi
+    /// use ode::Fixed;
+    /// use ode::ops::{Advance, Flow};
+    /// use core::array::Vector;
+    ///
+    /// let phi = Flow::of(|y: Vector<f64>| -> Vector<f64> { y }, 0.01, Fixed::Rk4);
+    /// assert(((phi ** 100 ⊳ [1.0])[0] - 1.0f64.exp()).abs() < 1e-9);
+    /// ```
+    pub fn of(f: fn(Vector<f64>) -> Vector<f64>, h: f64, method: Fixed = Fixed::Rk4) -> Flow {
+        Flow::new(|h: f64, y: Vector<f64>| -> Vector<f64> {
+            match method {
+                Fixed::Euler => y .+ f(y) .* h,
+                Fixed::Midpoint => y .+ f(y .+ f(y) .* (0.5 * h)) .* h,
+                Fixed::Heun => {
+                    let k1 = f(y);
+                    let k2 = f(y .+ k1 .* h);
+                    y .+ (k1 .+ k2) .* (0.5 * h)
+                },
+                Fixed::Rk4 => {
+                    let k1 = f(y);
+                    let k2 = f(y .+ k1 .* (0.5 * h));
+                    let k3 = f(y .+ k2 .* (0.5 * h));
+                    let k4 = f(y .+ k3 .* h);
+                    y .+ (k1 .+ k2 .* 2.0 .+ k3 .* 2.0 .+ k4) .* (h / 6.0)
+                },
+            }
+        }, h)
+    }
+
+    /// The drift `q += h velocity(p)` on a state `[q, p]` of `2 d`
+    /// values: the exact flow of the kinetic part of a separable
+    /// Hamiltonian.
+    ///
+    /// ```nabi
+    /// use ode::ops::{Advance, Flow};
+    /// use core::array::Vector;
+    ///
+    /// let d = Flow::drift(|p: Vector<f64>| -> Vector<f64> { p }, 1, 0.5);
+    /// assert(d ⊳ [1.0, 2.0] == [2.0, 2.0]);
+    /// ```
+    pub fn drift(velocity: fn(Vector<f64>) -> Vector<f64>, d: usize, h: f64) -> Flow {
+        Flow::new(|h: f64, y: Vector<f64>| -> Vector<f64> {
+            let out = y.copy();
+            let v = velocity(y[d..2 * d].copy());
+            for i in 0..d { out[i] = y[i] + h * v[i]; }
+            out
+        }, h)
+    }
+
+    /// The kick `p += h force(q)` on a state `[q, p]`: the exact flow of
+    /// the potential part.
+    ///
+    /// ```nabi
+    /// use ode::ops::{Advance, Flow};
+    /// use core::array::Vector;
+    ///
+    /// let k = Flow::kick(|q: Vector<f64>| -> Vector<f64> { -q }, 1, 0.5);
+    /// assert(k ⊳ [1.0, 2.0] == [1.0, 1.5]);
+    /// ```
+    pub fn kick(force: fn(Vector<f64>) -> Vector<f64>, d: usize, h: f64) -> Flow {
+        Flow::new(|h: f64, y: Vector<f64>| -> Vector<f64> {
+            let out = y.copy();
+            let a = force(y[0..d].copy());
+            for i in 0..d { out[d + i] = y[d + i] + h * a[i]; }
+            out
+        }, h)
+    }
+
+    /// `y0` and `steps` applications of the flow, as columns
+    /// (`[n, steps + 1]`).
+    ///
+    /// ```nabi
+    /// use ode::ops::Flow;
+    /// use core::array::Vector;
+    ///
+    /// let grow = Flow::new(|h: f64, y: Vector<f64>| -> Vector<f64> { y .* (1.0 + h) }, 1.0);
+    /// let y0: Vector<f64> = [1.0];
+    /// assert(grow.run(y0, 3)[0, 3] == 8.0);
+    /// ```
+    pub fn run(self, y0: Vector<f64>, steps: usize) -> core::array::Matrix<f64> {
+        let n = y0.len();
+        let d = List::filled(n * (steps + 1), 0.0);
+        let y = y0;
+        for j in 0..steps + 1 {
+            if j > 0 { y = (self.map)(1.0, y); }
+            for i in 0..n { d[i * (steps + 1) + j] = y[i]; }
+        }
+        Array::view_list(d, [n, steps + 1])
+    }
+}
+
+impl ops::Compose<Flow> for Flow {
+    type Output = Flow;
+    /// `a ∘ b`: `b`, then `a`.
+    fn compose(self, rhs: Flow) -> Flow {
+        let (a, b) = (self.map, rhs.map);
+        Flow { map: |s: f64, y: Vector<f64>| -> Vector<f64> { a(s, b(s, y)) } }
+    }
+}
+
+impl ops::Mul<Flow> for f64 {
+    type Output = Flow;
+    /// `c * a`: `a` with its step scaled by `c`.
+    fn mul(self, rhs: Flow) -> Flow {
+        let (c, a) = (self, rhs.map);
+        Flow { map: |s: f64, y: Vector<f64>| -> Vector<f64> { a(c * s, y) } }
+    }
+}
+
+impl ops::Pow<usize> for Flow {
+    type Output = Flow;
+    /// `a ** n`: `n` steps of `a`.
+    fn pow(self, n: usize) -> Flow {
+        let a = self.map;
+        Flow {
+            map: |s: f64, y: Vector<f64>| -> Vector<f64> {
+                let z = y;
+                for _ in 0..n { z = a(s, z); }
+                z
+            },
+        }
+    }
+}
+
+/// `phi ⊳ y`: the flow `phi` applied to the state `y`. Binds like `*`,
+/// looser than `∘` and `**`, so `a ∘ b ⊳ y` is `(a ∘ b) ⊳ y` and
+/// `phi ** 10 ⊳ y` takes ten steps.
+///
+/// ```nabi
+/// use ode::ops::{Advance, Flow};
+/// use core::array::Vector;
+///
+/// let shift = Flow::new(|h: f64, y: Vector<f64>| -> Vector<f64> { y .+ h }, 1.0);
+/// assert((shift ** 3 ⊳ [0.0])[0] == 3.0 && ((2.0 * shift) ∘ shift ⊳ [0.0])[0] == 3.0);
+/// ```
+pub trait Advance {
+    #[infix("⊳", like = "*")]
+    fn advance(self, y: Vector<f64>) -> Vector<f64>;
+}
+
+impl Advance for Flow {
+    fn advance(self, y: Vector<f64>) -> Vector<f64> { (self.map)(1.0, y) }
+}

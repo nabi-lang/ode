@@ -1,0 +1,68 @@
+// Stiff benchmarks against the reference values in `problems`.
+
+use pkg::tests::suite::expect;
+use pkg::{Jacobian, Method};
+use core::array::{Array, Vector};
+
+const STIFF: [Method; 4] = [Method::Radau, Method::Bdf, Method::Rodas, Method::Auto];
+
+/// Each component within `tol |ref| + 10 atol`.
+fn check(name: str, p: pkg::problems::Problem, m: Method, rtol: f64, atol: List<f64>, tol: f64, exact: bool) {
+    let jac = if exact { Jacobian::Exact(p.jac) } else { Jacobian::Approx };
+    let r = try! pkg::solve_ivp(p.f, p.span, p.y0, method: m, rtol: rtol, atol: Array::from_list(atol, [atol.len()]), jac: jac, dense: false);
+    expect(r.status == pkg::Status::Finished, f"{name} {m:?}: {r.status}");
+    let y = r.last();
+    for i in 0..y.len() {
+        let err = (y[i] - p.reference[i]).abs();
+        expect(err <= tol * p.reference[i].abs() + 10.0 * atol[i], f"{name} {m:?} y[{i}]: {y[i]} vs {p.reference[i]}");
+    }
+}
+
+#[test]
+fn robertson() {
+    for m in STIFF {
+        check("Robertson", pkg::problems::robertson(), m, 1e-8, [1e-10, 1e-14, 1e-10], 1e-3, false);
+        check("Robertson", pkg::problems::robertson(), m, 1e-8, [1e-10, 1e-14, 1e-10], 1e-3, true);
+    }
+}
+
+#[test]
+fn van_der_pol_stiff() {
+    for m in STIFF {
+        check("Van der Pol", pkg::problems::van_der_pol(1000.0), m, 1e-8, List::filled(2, 1e-8), 1e-4, true);
+    }
+}
+
+#[test]
+fn hires() {
+    for m in STIFF {
+        check("HIRES", pkg::problems::hires(), m, 1e-8, List::filled(8, 1e-10), 1e-4, m == Method::Radau);
+    }
+}
+
+#[test]
+fn oregonator() {
+    for m in STIFF {
+        check("Oregonator", pkg::problems::oregonator(), m, 1e-9, List::filled(3, 1e-9), 1e-4, m != Method::Bdf);
+    }
+}
+
+#[test]
+fn auto_switches_on_stiffness() {
+    let p = pkg::problems::van_der_pol(1000.0);
+    let r = try! pkg::solve_ivp(p.f, p.span, p.y0, method: Method::Auto, rtol: 1e-6, atol: 1e-6);
+    expect(r.switches.len() >= 2, f"Auto switched {r.switches.len()} times on Van der Pol (mu = 1000)");
+    let e = try! pkg::solve_ivp(p.f, p.span, p.y0, method: Method::Rk45, rtol: 1e-6, atol: 1e-6, dense: false, max_step: 100.0);
+    expect(r.nfev * 20 < e.nfev, f"Auto ({r.nfev} evaluations) beats RK45 ({e.nfev}) on a stiff problem");
+    let l = pkg::problems::lorenz();
+    let s = try! pkg::solve_ivp(l.f, l.span, l.y0, method: Method::Auto, rtol: 1e-8, atol: 1e-8);
+    expect(s.switches.len() == 0, f"no switch on the non-stiff Lorenz system: {s.switches:?}");
+}
+
+#[test]
+fn jacobian_counts() {
+    let p = pkg::problems::robertson();
+    let r = try! pkg::solve_ivp(p.f, p.span, p.y0, method: Method::Bdf, rtol: 1e-6, atol: [1e-8, 1e-12, 1e-8], jac: Jacobian::Exact(p.jac));
+    let a = try! pkg::solve_ivp(p.f, p.span, p.y0, method: Method::Bdf, rtol: 1e-6, atol: [1e-8, 1e-12, 1e-8]);
+    expect(r.njev > 0 && r.nlu > 0 && r.nfev < a.nfev, f"exact Jacobian saves evaluations: {r.nfev} vs {a.nfev}");
+}

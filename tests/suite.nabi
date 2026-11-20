@@ -1,0 +1,57 @@
+// Tests: closed-form solutions, convergence orders measured from the
+// error at two step sizes, stiff benchmarks against reference values,
+// event location, energy behaviour of the symplectic methods, boundary
+// value problems with known solutions, the `ops` notation, random
+// linear systems against `expm`, and input errors.
+
+mod bvp;
+mod closed;
+mod errors;
+mod events;
+mod fixed;
+#[cfg(feature = "ops")]
+mod ops;
+mod order;
+mod random;
+mod stiff;
+mod symplectic;
+
+use pkg::OdeError;
+use core::array::{Array, Vector};
+
+pub fn expect(ok: bool, what: str) {
+    if !ok { panic(f"check failed: {what}"); }
+}
+
+/// `|a - b| <= tol`.
+pub fn close(a: f64, b: f64, tol: f64, what: str) {
+    if !((a - b).abs() <= tol) { panic(f"check failed: {what}: {a} vs {b} (tol {tol})"); }
+}
+
+/// `|a - b| <= tol * max(|b|, floor)`.
+pub fn rel(a: f64, b: f64, tol: f64, floor: f64, what: str) {
+    if !((a - b).abs() <= tol * b.abs().max(floor)) { panic(f"check failed: {what}: {a} vs {b} (rel tol {tol})"); }
+}
+
+/// `log2(e1 / e2)`: the observed order when `e2` used half the step.
+pub fn slope(e1: f64, e2: f64) -> f64 { (e1 / e2).log2() }
+
+/// The observed order lies in `want - 0.25 ..= want + hi`.
+pub fn order_near(e1: f64, e2: f64, want: f64, hi: f64, what: str) {
+    let s = slope(e1, e2);
+    if !(s >= want - 0.25 && s <= want + hi) { panic(f"check failed: {what}: observed order {s} (errors {e1}, {e2}), expected {want}"); }
+}
+
+/// Whether `f` throws an `OdeError` whose variant is `want`.
+pub fn throws_kind(f: fn() throws (OdeError), want: str) -> bool {
+    try { f(); false } catch e: OdeError {
+        let k = match e {
+            OdeError::BadArgument { .. } => "BadArgument",
+            OdeError::LengthMismatch { .. } => "LengthMismatch",
+            OdeError::NotFinite { .. } => "NotFinite",
+        };
+        k == want
+    }
+}
+
+pub fn vec(xs: List<f64>) -> Vector<f64> { Array::from_list(xs, [xs.len()]) }

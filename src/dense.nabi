@@ -1,0 +1,221 @@
+// Dense output: one interpolant per step, each the continuous extension
+// of the method that took the step, and a search over the step ends.
+
+use core::array::{Array, Matrix, Vector};
+use core::range::Range;
+
+/// One step's interpolant; `x = (t - t0) / h`.
+#[derive(Clone)]
+pub(pkg) enum Piece {
+    /// `y0 + sum_j q[:, j] x^(j + 1)`, `q` row-major `n x k`: the
+    /// Runge-Kutta, Radau, Rosenbrock and Hermite extensions.
+    Poly { t0: f64; h: f64; y0: List<f64>; q: List<f64>; k: usize; },
+    /// DOP853's degree-7 extension in Hairer's nested form, `f` the
+    /// seven coefficient rows, highest first when evaluated.
+    Dop { t0: f64; h: f64; y0: List<f64>; f: List<f64>; },
+    /// BDF's interpolating polynomial through the backward differences
+    /// `d` (`order + 1` rows) at `t, t - h, ...`.
+    Bdf { t: f64; h: f64; order: usize; d: List<f64>; },
+}
+
+impl Piece {
+    /// The value at `t` into `out`.
+    pub(pkg) fn eval_into(self, t: f64, out: List<f64>) {
+        let n = out.len();
+        match self {
+            Piece::Poly { t0, h, y0, q, k } => {
+                let x = (t - t0) / h;
+                for i in 0..n {
+                    // Horner in x, then one more factor of x.
+                    let acc = 0.0;
+                    let j = k;
+                    while j > 0 {
+                        j -= 1;
+                        acc = acc * x + q[i * k + j];
+                    }
+                    out[i] = y0[i] + acc * x;
+                }
+            },
+            Piece::Dop { t0, h, y0, f } => {
+                let x = (t - t0) / h;
+                for i in 0..n { out[i] = 0.0; }
+                for r in 0..7 {
+                    let row = 6 - r;
+                    let w = if r % 2 == 0 { x } else { 1.0 - x };
+                    for i in 0..n { out[i] = (out[i] + f[row * n + i]) * w; }
+                }
+                for i in 0..n { out[i] += y0[i]; }
+            },
+            Piece::Bdf { t: tn, h, order, d } => {
+                for i in 0..n { out[i] = d[i]; }
+                let p = 1.0;
+                for j in 0..order {
+                    p *= (t - (tn - h * (j as f64))) / (h * ((j + 1) as f64));
+                    for i in 0..n { out[i] += d[(j + 1) * n + i] * p; }
+                }
+            },
+        }
+    }
+}
+
+/// The continuous solution of an initial value problem: `sol(t)` (or
+/// `sol.at(t)`) reads it anywhere on the span, between steps too, and
+/// `sol(ts)` at every time of a vector, to the accuracy of the
+/// method's own interpolant (order 3 for RK23, 4 for RK45, 7 for
+/// DOP853, 3 for Radau, the current order for BDF). Outside the span it
+/// extends the first or last step's polynomial. Each lookup is a binary
+/// search over the steps, O(log steps + n).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let y0: Vector<f64> = [1.0];
+/// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { -y }, 0.0..2.0, y0, rtol: 1e-8, atol: 1e-10);
+/// assert(((r.sol)(0.7)[0] - (-0.7f64).exp()).abs() < 1e-7);
+/// let sol = r.sol;
+/// assert(sol([0.5, 0.7])[0, 1] == sol(0.7)[0]);
+/// assert(sol.span().start == 0.0 && sol.span().end == 2.0);
+/// ```
+#[derive(Clone)]
+pub struct Dense {
+    pub(pkg) ts: List<f64>;
+    pub(pkg) pieces: List<Piece>;
+    pub(pkg) y0: List<f64>;
+    pub(pkg) n: usize;
+}
+
+impl Dense {
+    pub(pkg) fn new(t0: f64, y0: List<f64>) -> Dense { Dense { ts: [t0], pieces: [], y0: y0, n: y0.len() } }
+
+    pub(pkg) fn push(ref self, t_end: f64, p: Piece) {
+        self.ts.push(t_end);
+        self.pieces.push(p);
+    }
+
+    /// The piece covering `t`.
+    fn find(self, t: f64) -> usize {
+        let m = self.pieces.len();
+        let up = self.ts[m] >= self.ts[0];
+        let (lo, hi) = (0usize, m);
+        // Invariant: the piece lies in lo..hi.
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            let before = if up { t < self.ts[mid] } else { t > self.ts[mid] };
+            if before { hi = mid; } else { lo = mid; }
+        }
+        lo
+    }
+
+    /// The solution at `t`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let y0: Vector<f64> = [0.0, 1.0];
+    /// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0]] }, 0.0..3.0, y0, method: ode::Method::Dop853, rtol: 1e-10, atol: 1e-12);
+    /// let y = r.sol.at(1.0);
+    /// assert((y[0] - 1.0f64.sin()).abs() < 1e-9 && (y[1] - 1.0f64.cos()).abs() < 1e-9);
+    /// ```
+    pub fn at(self, t: f64) -> Vector<f64> {
+        let out = List::filled(self.n, 0.0);
+        self.at_into(t, out);
+        Array::view_list(out, [self.n])
+    }
+
+    pub(pkg) fn at_into(self, t: f64, out: List<f64>) {
+        if self.pieces.len() == 0 {
+            for i in 0..self.n { out[i] = self.y0[i]; }
+            return;
+        }
+        self.pieces[self.find(t)].eval_into(t, out);
+    }
+
+    /// The solution at every time of `ts`, as columns: shape
+    /// `[n, ts.len()]`, like `Solution.y`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let y0: Vector<f64> = [1.0];
+    /// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 0.0..1.0, y0, rtol: 1e-9, atol: 1e-12);
+    /// let ys = r.sol.eval([0.25, 0.5, 1.0]);
+    /// assert(ys.shape() == [1, 3] && (ys[0, 1] - 0.5f64.exp()).abs() < 1e-8);
+    /// ```
+    pub fn eval(self, ts: Vector<f64>) -> Matrix<f64> {
+        let (n, m) = (self.n, ts.len());
+        let data = List::filled(n * m, 0.0);
+        let col = List::filled(n, 0.0);
+        let j = 0usize;
+        for t in ts {
+            self.at_into(t, col);
+            for i in 0..n { data[i * m + j] = col[i]; }
+            j += 1;
+        }
+        Array::view_list(data, [n, m])
+    }
+
+    /// Component `i` as a function of time, for quadrature or root
+    /// finding: `sol.component(0)(t) == sol.at(t)[0]`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let y0: Vector<f64> = [0.0];
+    /// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [2.0 * t] }, 0.0..1.0, y0);
+    /// let g = r.sol.component(0);
+    /// assert((g(0.5) - 0.25).abs() < 1e-12);
+    /// ```
+    /// An `i` past the last component gives NaN everywhere.
+    pub fn component(self, i: usize) -> fn(f64) -> f64 {
+        if i >= self.n { return |_t: f64| -> f64 { f64::NAN }; }
+        let s = self;
+        let out = List::filled(self.n, 0.0);
+        |t: f64| -> f64 {
+            s.at_into(t, out);
+            out[i]
+        }
+    }
+
+    /// The time span covered, from the start to the last step's end.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let y0: Vector<f64> = [1.0];
+    /// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 0.0..1.0, y0);
+    /// assert(r.sol.span().start == 0.0 && r.sol.span().end == 1.0);
+    /// ```
+    pub fn span(self) -> Range<f64> { self.ts[0]..self.ts[self.pieces.len()] }
+
+    /// The number of steps (interpolants).
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let y0: Vector<f64> = [1.0];
+    /// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 0.0..1.0, y0);
+    /// assert(r.sol.steps() == r.steps);
+    /// ```
+    pub fn steps(self) -> usize { self.pieces.len() }
+
+    /// The step ends, from the start: `steps() + 1` times.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let y0: Vector<f64> = [1.0];
+    /// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 0.0..1.0, y0);
+    /// assert(r.sol.breakpoints() == r.t);
+    /// ```
+    pub fn breakpoints(self) -> Vector<f64> { Array::from_list(self.ts.clone(), [self.ts.len()]) }
+}
+
+impl ops::Call<f64> for Dense {
+    type Output = Vector<f64>;
+    fn call(self, t: f64) -> Vector<f64> { self.at(t) }
+}
+
+impl ops::Call<Vector<f64>> for Dense {
+    type Output = Matrix<f64>;
+    fn call(self, ts: Vector<f64>) -> Matrix<f64> { self.eval(ts) }
+}

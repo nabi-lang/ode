@@ -1,0 +1,170 @@
+// The right-hand side as the steppers see it: counted evaluations on
+// plain lists, the tolerances, the Jacobian, and the helpers every
+// adaptive method shares (weighted RMS norm, Hairer's starting step).
+//
+// State lists are never written after they are handed to `f` or come
+// back from it: the user's function may keep or return its argument.
+
+use pkg::dense::Piece;
+use pkg::{Jacobian, OdeError};
+use core::array::{Array, Matrix, Vector};
+
+const SQRT_EPS: f64 = 1.4901161193847656e-8;
+
+pub(pkg) struct System {
+    pub(pkg) f: fn(f64, Vector<f64>) -> Vector<f64>;
+    pub(pkg) n: usize;
+    pub(pkg) rtol: f64;
+    pub(pkg) atol: List<f64>;
+    pub(pkg) jac: Jacobian;
+    pub(pkg) t_bound: f64;
+    /// +1 forward, -1 backward.
+    pub(pkg) dir: f64;
+    pub(pkg) max_step: f64;
+    pub(pkg) nfev: usize;
+    pub(pkg) njev: usize;
+    pub(pkg) nlu: usize;
+}
+
+impl System {
+    /// `f(t, y)` as a list.
+    pub(pkg) fn eval(ref self, t: f64, y: List<f64>) throws (OdeError) -> List<f64> {
+        self.nfev += 1;
+        let v = (self.f)(t, Array::view_list(y, [self.n]));
+        if v.len() != self.n {
+            throw OdeError::LengthMismatch { what: f"f(t, y) returned {v.len()} values for {self.n} unknowns; return one derivative per component of y" };
+        }
+        match v.as_list() {
+            xs: List<f64> => xs,
+            none => v.to_list(),
+        }
+    }
+
+    /// `atol + rtol * max(|a|, |b|)` per component.
+    pub(pkg) fn scale2(self, a: List<f64>, b: List<f64>) -> List<f64> {
+        let n = self.n;
+        let s = List::filled(n, 0.0);
+        for i in 0..n { s[i] = self.atol[i] + self.rtol * a[i].abs().max(b[i].abs()); }
+        s
+    }
+
+    /// `atol + rtol * |a|` per component.
+    pub(pkg) fn scale(self, a: List<f64>) -> List<f64> {
+        let n = self.n;
+        let s = List::filled(n, 0.0);
+        for i in 0..n { s[i] = self.atol[i] + self.rtol * a[i].abs(); }
+        s
+    }
+
+    /// The Jacobian `df/dy` at `(t, y)`, row-major; `f0 = f(t, y)`.
+    /// Finite differences take `n` evaluations of `f`, with steps
+    /// `sqrt(eps) max(|y_j|, atol_j)` signed like `f0_j`.
+    pub(pkg) fn jacobian(ref self, t: f64, y: List<f64>, f0: List<f64>) throws (OdeError) -> List<f64> {
+        let n = self.n;
+        self.njev += 1;
+        match self.jac {
+            Jacobian::Exact(j) => {
+                let m = j(t, Array::view_list(y, [n]));
+                let s = m.shape();
+                if s[0] != n || s[1] != n {
+                    throw OdeError::LengthMismatch { what: f"jac(t, y) returned a {s[0]} x {s[1]} matrix for {n} unknowns; return the n x n matrix of df_i/dy_j" };
+                }
+                return m.to_list();
+            },
+            Jacobian::Constant(m) => return m.to_list(),
+            Jacobian::Approx => {},
+        }
+        let jm = List::filled(n * n, 0.0);
+        for j in 0..n {
+            let yj = y.clone();
+            let h = SQRT_EPS * y[j].abs().max(self.atol[j]).max(f64::MIN_POSITIVE);
+            if f0[j] < 0.0 { h = -h; }
+            yj[j] = y[j] + h;
+            h = yj[j] - y[j];
+            let fj = try self.eval(t, yj);
+            for i in 0..n { jm[i * n + j] = (fj[i] - f0[i]) / h; }
+        }
+        jm
+    }
+
+    /// Whether the Jacobian is a fixed matrix (never recomputed).
+    pub(pkg) fn constant_jac(self) -> bool {
+        match self.jac {
+            Jacobian::Constant(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Hairer, Norsett and Wanner's starting step (Solving ODEs I,
+    /// II.4) for a method of order `order`: one extra evaluation.
+    pub(pkg) fn initial_step(ref self, t0: f64, y0: List<f64>, f0: List<f64>, order: f64) throws (OdeError) -> f64 {
+        let n = self.n;
+        if n == 0 { return f64::INFINITY; }
+        let span = (self.t_bound - t0).abs();
+        if span == 0.0 { return 0.0; }
+        let sc = self.scale(y0);
+        let d0 = rms_ratio(y0, sc);
+        let d1 = rms_ratio(f0, sc);
+        let h0 = if d0 < 1e-5 || d1 < 1e-5 { 1e-6 } else { 0.01 * d0 / d1 };
+        h0 = h0.min(span);
+        let y1 = List::filled(n, 0.0);
+        for i in 0..n { y1[i] = y0[i] + h0 * self.dir * f0[i]; }
+        let t1 = t0 + h0 * self.dir;
+        let f1 = try self.eval(t1, y1);
+        let df = List::filled(n, 0.0);
+        for i in 0..n { df[i] = f1[i] - f0[i]; }
+        let d2 = rms_ratio(df, sc) / h0;
+        let h1 = if d1 <= 1e-15 && d2 <= 1e-15 { 1e-6f64.max(h0 * 1e-3) } else { (0.01 / d1.max(d2)).pow(1.0 / (order + 1.0)) };
+        (100.0 * h0).min(h1).min(span).min(self.max_step)
+    }
+
+    /// The smallest step that still moves `t`.
+    pub(pkg) fn min_step(self, t: f64) -> f64 { 10.0 * (t.next_after(self.dir * f64::INFINITY) - t).abs() }
+}
+
+/// RMS of `x / s`.
+pub(pkg) fn rms_ratio(x: List<f64>, s: List<f64>) -> f64 {
+    let n = x.len();
+    if n == 0 { return 0.0; }
+    let acc = 0.0;
+    for i in 0..n {
+        let r = x[i] / s[i];
+        acc += r * r;
+    }
+    (acc / (n as f64)).sqrt()
+}
+
+/// Whether every value is finite.
+pub(pkg) fn finite(x: List<f64>) -> bool {
+    for v in x {
+        if !v.is_finite() { return false; }
+    }
+    true
+}
+
+/// `I * d - c * J` for a row-major `n x n` list `j`, as a matrix.
+pub(pkg) fn shifted(j: List<f64>, n: usize, d: f64, c: f64) -> Matrix<f64> {
+    let m = List::filled(n * n, 0.0);
+    for i in 0..n * n { m[i] = -c * j[i]; }
+    for i in 0..n { m[i * n + i] += d; }
+    Array::view_list(m, [n, n])
+}
+
+/// How a step attempt ended.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(pkg) enum Outcome {
+    Accepted,
+    /// The step size fell below the spacing of floats at `t`.
+    TooSmall,
+    /// As `TooSmall`, after `f` gave NaN or infinity.
+    NotFinite,
+}
+
+/// What the driver needs from a method.
+pub(pkg) trait Stepper {
+    fn time(self) -> f64;
+    fn state(self) -> List<f64>;
+    fn advance(ref self, ref sys: System) throws (OdeError) -> Outcome;
+    /// The interpolant of the step just taken.
+    fn interpolant(ref self, ref sys: System) throws (OdeError) -> Piece;
+}

@@ -1,0 +1,36 @@
+use pkg::Fixed;
+use pkg::tests::suite::{close, expect, order_near};
+use core::array::Vector;
+
+#[test]
+fn fixed_orders() {
+    let y0: Vector<f64> = [1.0];
+    // y' = y cos t, y = e^(sin t).
+    let f = |t: f64, y: Vector<f64>| -> Vector<f64> { [y[0] * t.cos()] };
+    let exact = 2.0f64.sin().exp();
+    for m in [Fixed::Euler, Fixed::Midpoint, Fixed::Heun, Fixed::Rk4] {
+        let e1 = ((try! pkg::fixed(f, 0.0..2.0, y0, 40, method: m)).last()[0] - exact).abs();
+        let e2 = ((try! pkg::fixed(f, 0.0..2.0, y0, 80, method: m)).last()[0] - exact).abs();
+        order_near(e1, e2, m.order() as f64, 0.3, f"{m:?}");
+    }
+}
+
+#[test]
+fn euler_closed_form_and_grid() {
+    let y0: Vector<f64> = [1.0];
+    let r = try! pkg::euler(|t: f64, y: Vector<f64>| -> Vector<f64> { y .* 2.0 }, 0.0..1.0, y0, 10);
+    close(r.last()[0], 1.2f64.powi(10), 1e-13, "Euler is (1 + h a)^n");
+    expect(r.t.len() == 11 && r.t[10] == 1.0 && r.nfev == 11, f"grid and evaluations: {r.nfev}");
+    let b = try! pkg::rk4(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 1.0..0.0, y0, 100);
+    close(b.last()[0], (-1.0f64).exp(), 1e-9, "backwards");
+    // Hermite dense output between nodes.
+    let s = try! pkg::rk4(|t: f64, y: Vector<f64>| -> Vector<f64> { [t.cos()] }, 0.0..3.0, Vector::<f64>::from([0.0]), 300);
+    close(s.sol.at(1.234)[0], 1.234f64.sin(), 1e-9, "dense");
+}
+
+#[test]
+fn fixed_stops_on_nan() {
+    let y0: Vector<f64> = [1.0];
+    let r = try! pkg::fixed(|t: f64, y: Vector<f64>| -> Vector<f64> { y .* y .* 100.0 }, 0.0..1.0, y0, 10, method: Fixed::Euler);
+    expect(r.status == pkg::Status::NotFinite && r.t.len() < 11, f"overflow stops the run: {r.status:?}");
+}

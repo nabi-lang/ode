@@ -1,0 +1,37 @@
+use pkg::tests::suite::{expect, throws_kind};
+use pkg::{Jacobian, Method};
+use core::array::{Array, Matrix, Vector};
+
+#[test]
+fn bad_input_throws() {
+    let f = |t: f64, y: Vector<f64>| -> Vector<f64> { y };
+    let y0: Vector<f64> = [1.0, 2.0];
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, rtol: 0.0); }, "BadArgument"), "rtol 0");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, atol: -1.0); }, "BadArgument"), "negative atol");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, atol: [1e-6]); }, "LengthMismatch"), "atol length");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..f64::INFINITY, y0); }, "BadArgument"), "infinite span");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, Vector::<f64>::from([f64::NAN])); }, "NotFinite"), "NaN y0");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [1.0] }, 0.0..1.0, y0); }, "LengthMismatch"), "f length");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y .* f64::INFINITY }, 0.0..1.0, y0); }, "NotFinite"), "f(t0) infinite");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, t_eval: [0.5, 2.0]); }, "BadArgument"), "t_eval outside");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, t_eval: [0.5, 0.2]); }, "BadArgument"), "t_eval order");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, max_step: 0.0); }, "BadArgument"), "max_step");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, first_step: 2.0); }, "BadArgument"), "first_step");
+    let j: Matrix<f64> = Array::zeros([3, 3]);
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, method: Method::Radau, jac: Jacobian::Constant(j)); }, "LengthMismatch"), "Jacobian shape");
+    expect(throws_kind(|| { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, method: Method::Bdf, jac: Jacobian::Exact(|t: f64, y: Vector<f64>| -> Matrix<f64> { Array::zeros([1, 1]) })); }, "LengthMismatch"), "jac result shape");
+    expect(throws_kind(|| { _ = try pkg::fixed(f, 0.0..1.0, y0, 0); }, "BadArgument"), "zero steps");
+    expect(throws_kind(|| { _ = try pkg::verlet(|q: Vector<f64>| -> Vector<f64> { q }, y0, Vector::<f64>::from([1.0]), 0.0..1.0, 10); }, "LengthMismatch"), "q0 p0 lengths");
+    let msg = try { _ = try pkg::solve_ivp(f, 0.0..1.0, y0, rtol: -2.0); "" } catch e: pkg::OdeError { f"{e}" };
+    expect(msg.contains("rtol: 1e-6"), f"message says what to write: {msg}");
+}
+
+#[test]
+fn huge_and_tiny_magnitudes() {
+    // Scale invariance: y' = -y at 1e150 and 1e-150, relative error alike.
+    for s in [1e150, 1e-150] {
+        let y0: Vector<f64> = [s];
+        let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { -y }, 0.0..1.0, y0, rtol: 1e-8, atol: 0.0);
+        expect(((r.last()[0] / s) - (-1.0f64).exp()).abs() < 1e-7, f"scale {s}");
+    }
+}

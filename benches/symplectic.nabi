@@ -1,0 +1,41 @@
+// Fixed-step and symplectic integrators. Items are force evaluations
+// (body pairs for N-body), so items/s reads as evaluation throughput.
+
+use pkg::Symplectic;
+use core::array::{Array, Vector};
+use core::bench::Bench;
+use core::hint::black_box;
+
+#[bench]
+fn nbody_leapfrog(b: Bench) {
+    // 16 bodies on a ring with small random-free perturbations, 1000 steps.
+    let nb = 16;
+    let mass = List::filled(nb, 1.0 / (nb as f64));
+    let q: Vector<f64> = Array::zeros([3 * nb]);
+    let v: Vector<f64> = Array::zeros([3 * nb]);
+    for i in 0..nb {
+        let a = 6.283185307179586 * (i as f64) / (nb as f64);
+        q[3 * i] = a.cos();
+        q[3 * i + 1] = a.sin();
+        q[3 * i + 2] = 0.01 * ((i % 3) as f64);
+        v[3 * i] = -0.5 * a.sin();
+        v[3 * i + 1] = 0.5 * a.cos();
+    }
+    let acc = pkg::problems::gravity(mass, 0.01);
+    b.set_items((1000 * nb * (nb - 1) / 2) as i64);
+    b.iter(|| try! pkg::leapfrog(acc, q, v, 0.0..10.0, 1000, every: 1000));
+}
+
+#[bench]
+fn kepler_yoshida4(b: Bench) {
+    let (force, q0, p0, _) = pkg::problems::kepler(0.5);
+    b.set_items(3 * 10000);
+    b.iter(|| try! pkg::symplectic(|p: Vector<f64>| -> Vector<f64> { p }, force, q0, p0, 0.0..100.0, 10000, method: Symplectic::Yoshida4, every: 10000));
+}
+
+#[bench]
+fn oscillator_rk4(b: Bench) {
+    let y0: Vector<f64> = [1.0, 0.0];
+    b.set_items(4 * 10000);
+    b.iter(|| try! pkg::rk4(black_box(|t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0]] }), 0.0..100.0, y0, 10000));
+}

@@ -1,0 +1,192 @@
+// RODAS, the stiffly accurate Rosenbrock method of order 4(3) of Hairer
+// and Wanner (Solving ODEs II, VI.4, coefficients of the RODAS code):
+// six linear stages with one LU of `I / (h gamma) - J` per step, no
+// Newton iteration, L-stable, with the 3rd order dense output of RODAS.
+// The Jacobian is evaluated at every step (Rosenbrock methods need the
+// true one for their order), `df/dt` by one forward difference. Step
+// control: `h_new = h / max(1/6, min(5, err^(1/4) / 0.9))` with
+// Gustafsson's predictive correction after an accepted step.
+
+use pkg::OdeError;
+use pkg::dense::Piece;
+use pkg::ivp::system::{Outcome, Stepper, System, rms_ratio};
+use core::array::Array;
+use linalg::Lu;
+
+const C2: f64 = 0.386;
+const C3: f64 = 0.21;
+const C4: f64 = 0.63;
+const D1: f64 = 0.25;
+const D2: f64 = -0.1043;
+const D3: f64 = 0.1035;
+const D4: f64 = -0.3620000000000023e-01;
+const A21: f64 = 0.1544e+01;
+const A31: f64 = 0.9466785280815826;
+const A32: f64 = 0.2557011698983284;
+const A41: f64 = 0.3314825187068521e+01;
+const A42: f64 = 0.2896124015972201e+01;
+const A43: f64 = 0.9986419139977817;
+const A51: f64 = 0.1221224509226641e+01;
+const A52: f64 = 0.6019134481288629e+01;
+const A53: f64 = 0.1253708332932087e+02;
+const A54: f64 = -0.6878860361058950;
+const C21: f64 = -0.56688e+01;
+const C31: f64 = -0.2430093356833875e+01;
+const C32: f64 = -0.2063599157091915;
+const C41: f64 = -0.1073529058151375;
+const C42: f64 = -0.9594562251023355e+01;
+const C43: f64 = -0.2047028614809616e+02;
+const C51: f64 = 0.7496443313967647e+01;
+const C52: f64 = -0.1024680431464352e+02;
+const C53: f64 = -0.3399990352819905e+02;
+const C54: f64 = 0.1170890893206160e+02;
+const C61: f64 = 0.8083246795921522e+01;
+const C62: f64 = -0.7981132988064893e+01;
+const C63: f64 = -0.3152159432874371e+02;
+const C64: f64 = 0.1631930543123136e+02;
+const C65: f64 = -0.6058818238834054e+01;
+const GAMMA: f64 = 0.25;
+const E21: f64 = 0.1012623508344586e+02;
+const E22: f64 = -0.7487995877610167e+01;
+const E23: f64 = -0.3480091861555747e+02;
+const E24: f64 = -0.7992771707568823e+01;
+const E25: f64 = 0.1025137723295662e+01;
+const E31: f64 = -0.6762803392801253;
+const E32: f64 = 0.6087714651680015e+01;
+const E33: f64 = 0.1643084320892478e+02;
+const E34: f64 = 0.2476722511418386e+02;
+const E35: f64 = -0.6594389125716872e+01;
+
+const SAFE: f64 = 0.9;
+const FAC1: f64 = 5.0;
+const FAC2: f64 = 1.0 / 6.0;
+
+pub(pkg) struct Rodas {
+    pub(pkg) t: f64;
+    pub(pkg) y: List<f64>;
+    f: List<f64>;
+    pub(pkg) h_abs: f64;
+    /// Last accepted step and error, for the predictive controller;
+    /// negative: none.
+    h_acc: f64;
+    err_acc: f64;
+    first: bool;
+    piece: Piece | none;
+}
+
+/// `a + sum_i w_i k_i` over the nonzero weights.
+fn comb(a: List<f64>, ks: List<List<f64>>, ws: List<f64>) -> List<f64> {
+    let r = a.clone();
+    for i in 0..ws.len() {
+        let w = ws[i];
+        if w == 0.0 { continue; }
+        let k = ks[i];
+        for m in 0..r.len() { r[m] += w * k[m]; }
+    }
+    r
+}
+
+impl Rodas {
+    pub(pkg) fn new(ref sys: System, t0: f64, y0: List<f64>, f0: List<f64>, first_step: f64) throws (OdeError) -> Rodas {
+        let h = if first_step > 0.0 { first_step } else { try sys.initial_step(t0, y0, f0, 3.0) };
+        Rodas { t: t0, y: y0, f: f0, h_abs: h, h_acc: -1.0, err_acc: -1.0, first: true, piece: none }
+    }
+
+    fn solve(lu: Lu<f64>, b: List<f64>) -> List<f64> {
+        let n = b.len();
+        let x = try lu.solve(Array::view_list(b, [n])) catch _ { return List::filled(n, f64::NAN); };
+        match x.as_list() {
+            xs: List<f64> => xs,
+            none => x.to_list(),
+        }
+    }
+
+    pub(pkg) fn step(ref self, ref sys: System) throws (OdeError) -> Outcome {
+        let n = sys.n;
+        let (t, y, f0) = (self.t, self.y, self.f);
+        let min_step = sys.min_step(t);
+        let h_abs = self.h_abs.min(sys.max_step).max(min_step);
+        let jm = try sys.jacobian(t, y, f0);
+        // df/dt by a forward difference.
+        let dt = (f64::EPSILON * 1e-5f64.max(t.abs())).sqrt() * sys.dir;
+        let ft = try sys.eval(t + dt, y);
+        let fx = List::filled(n, 0.0);
+        for m in 0..n { fx[m] = (ft[m] - f0[m]) / dt; }
+        let rejected = false;
+        let nan = false;
+        loop {
+            if h_abs < min_step { return if nan { Outcome::NotFinite } else { Outcome::TooSmall }; }
+            let t_new = t + h_abs * sys.dir;
+            if sys.dir * (t_new - sys.t_bound) > 0.0 { t_new = sys.t_bound; }
+            let h = t_new - t;
+            h_abs = h.abs();
+            sys.nlu += 1;
+            let lu = try linalg::lu(pkg::ivp::system::shifted(jm, n, 1.0 / (h * GAMMA), 1.0)) catch _ {
+                h_abs *= 0.5;
+                rejected = true;
+                continue;
+            };
+            let hc = |w: f64| -> f64 { w / h };
+            let b = comb(f0, [fx], [h * D1]);
+            let k1 = Rodas::solve(lu, b);
+            let s = try sys.eval(t + C2 * h, comb(y, [k1], [A21]));
+            let k2 = Rodas::solve(lu, comb(s, [k1, fx], [hc(C21), h * D2]));
+            s = try sys.eval(t + C3 * h, comb(y, [k1, k2], [A31, A32]));
+            let k3 = Rodas::solve(lu, comb(s, [k1, k2, fx], [hc(C31), hc(C32), h * D3]));
+            s = try sys.eval(t + C4 * h, comb(y, [k1, k2, k3], [A41, A42, A43]));
+            let k4 = Rodas::solve(lu, comb(s, [k1, k2, k3, fx], [hc(C41), hc(C42), hc(C43), h * D4]));
+            let y5 = comb(y, [k1, k2, k3, k4], [A51, A52, A53, A54]);
+            s = try sys.eval(t + h, y5);
+            let k5 = Rodas::solve(lu, comb(s, [k1, k2, k3, k4], [hc(C51), hc(C52), hc(C53), hc(C54)]));
+            let yh = comb(y5, [k5], [1.0]);
+            s = try sys.eval(t + h, yh);
+            let k6 = Rodas::solve(lu, comb(s, [k1, k2, k3, k4, k5], [hc(C61), hc(C62), hc(C63), hc(C64), hc(C65)]));
+            let y_new = comb(yh, [k6], [1.0]);
+            let err = rms_ratio(k6, sys.scale2(y, y_new));
+            if !(err <= 1.0) {
+                nan = err.is_nan();
+                let fac = if nan { FAC1 } else { FAC2.max(FAC1.min(err.pow(0.25) / SAFE)) };
+                h_abs = if self.first && !nan { 0.1 * h_abs } else { h_abs / fac };
+                rejected = true;
+                continue;
+            }
+            let fac = FAC2.max(FAC1.min(err.pow(0.25) / SAFE));
+            if self.h_acc > 0.0 {
+                let gus = (self.h_acc / h_abs) * (err * err / self.err_acc).pow(0.25) / SAFE;
+                fac = fac.max(FAC2.max(FAC1.min(gus)));
+            }
+            let h_new = h_abs / fac;
+            if rejected { h_new = h_new.min(h_abs); }
+            self.h_acc = h_abs;
+            self.err_acc = 0.01f64.max(err);
+            self.first = false;
+            let d2 = comb(List::filled(n, 0.0), [k1, k2, k3, k4, k5], [E21, E22, E23, E24, E25]);
+            let d3 = comb(List::filled(n, 0.0), [k1, k2, k3, k4, k5], [E31, E32, E33, E34, E35]);
+            // y0 (1 - s) + s (y1 + (1 - s) (d2 + s d3)) as powers of s.
+            let q = List::filled(3 * n, 0.0);
+            for m in 0..n {
+                q[3 * m] = y_new[m] - y[m] + d2[m];
+                q[3 * m + 1] = d3[m] - d2[m];
+                q[3 * m + 2] = -d3[m];
+            }
+            self.piece = Piece::Poly { t0: t, h: h, y0: y, q: q, k: 3 };
+            self.t = t_new;
+            self.y = y_new;
+            self.f = try sys.eval(t_new, y_new);
+            self.h_abs = h_new;
+            return Outcome::Accepted;
+        }
+    }
+}
+
+impl Stepper for Rodas {
+    fn time(self) -> f64 { self.t }
+    fn state(self) -> List<f64> { self.y }
+    fn advance(ref self, ref sys: System) throws (OdeError) -> Outcome { try self.step(ref sys) }
+    fn interpolant(ref self, ref sys: System) throws (OdeError) -> Piece {
+        match self.piece {
+            p: Piece => p,
+            none => Piece::Poly { t0: self.t, h: 1.0, y0: self.y, q: List::filled(3 * sys.n, 0.0), k: 3 },
+        }
+    }
+}

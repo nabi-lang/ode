@@ -1,0 +1,344 @@
+// Radau IIA of order 5 (Hairer and Wanner, Solving ODEs II, IV.8; the
+// RADAU5 code): a 3-stage implicit collocation method, L-stable and
+// stiffly accurate. The stage system is diagonalized by T into one real
+// and one complex n x n system, so each Newton iteration costs one real
+// and one complex LU solve; the LUs are kept until the step size changes
+// enough. Newton stops on the convergence-rate test of RADAU5 (at most
+// 6 iterations); a failure with a fresh Jacobian halves the step. The
+// error estimate is RADAU5's, filtered through the real LU and redone
+// with one more evaluation after a rejection, and the step size follows
+// Gustafsson's predictive controller. Dense output is the collocation
+// cubic. Following SciPy's `Radau` closely.
+
+use pkg::OdeError;
+use pkg::dense::Piece;
+use pkg::ivp::system::{Outcome, Stepper, System, finite, rms_ratio, shifted};
+use core::array::Array;
+use core::num::Complex;
+use linalg::Lu;
+
+const T: [f64; 9] = [
+    0.09443876248897524, -0.1412552950209542, 0.03002919410514742,
+    0.2502131229653333, 0.20412935229379994, -0.3829421127572619,
+    1.0, 1.0, 0.0,
+];
+const TI: [f64; 9] = [
+    4.178718591551904, 0.32768282076106237, 0.5233764454994495,
+    -4.178718591551904, -0.32768282076106237, 0.47662355450055044,
+    0.5028726349457868, -2.571926949855605, 0.5960392048282249,
+];
+// Collocation polynomial: Z^T P gives the coefficients of x, x^2, x^3.
+const P: [f64; 9] = [
+    10.048809399827414, -25.62959144707664, 15.580782047249224,
+    -1.382142733160748, 10.296258113743303, -8.914115380582556,
+    0.3333333333333333, -2.6666666666666665, 3.3333333333333335,
+];
+// Nodes (4 -+ sqrt 6) / 10, 1.
+const C: [f64; 3] = [0.15505102572168222, 0.6449489742783178, 1.0];
+const E: [f64; 3] = [-10.048809399827414, 1.382142733160748, -0.3333333333333333];
+// Eigenvalues of the inverse Radau matrix: 3 + 3^(2/3) - 3^(1/3) and
+// its complex pair.
+const MU_REAL: f64 = 3.637834252744496;
+const MU_RE: f64 = 2.6810828736277523;
+const MU_IM: f64 = -3.050430199247411;
+
+const NEWTON_MAXITER: usize = 6;
+const MIN_FACTOR: f64 = 0.2;
+const MAX_FACTOR: f64 = 10.0;
+
+pub(pkg) struct Radau {
+    pub(pkg) t: f64;
+    pub(pkg) y: List<f64>;
+    pub(pkg) f: List<f64>;
+    pub(pkg) h_abs: f64;
+    /// Negative: none.
+    h_abs_old: f64;
+    error_norm_old: f64;
+    newton_tol: f64;
+    pub(pkg) jac: List<f64>;
+    current_jac: bool;
+    lus: (Lu<f64>, Lu<Complex<f64>>) | none;
+    z: List<f64>;
+    sol: Piece | none;
+    t_old: f64;
+    y_old: List<f64>;
+}
+
+/// Result of one Newton solve of the stage system.
+struct Newton {
+    converged: bool;
+    iters: usize;
+    z: List<f64>;
+    rate: f64;
+}
+
+impl Radau {
+    pub(pkg) fn new(ref sys: System, t0: f64, y0: List<f64>, f0: List<f64>, first_step: f64) throws (OdeError) -> Radau {
+        let h = if first_step > 0.0 { first_step } else { try sys.initial_step(t0, y0, f0, 3.0) };
+        let j = try sys.jacobian(t0, y0, f0);
+        Radau {
+            t: t0, y: y0, f: f0, h_abs: h, h_abs_old: -1.0, error_norm_old: -1.0,
+            newton_tol: (10.0 * f64::EPSILON / sys.rtol).max(0.03f64.min(sys.rtol.sqrt())),
+            jac: j, current_jac: true, lus: none, z: [], sol: none, t_old: t0, y_old: y0,
+        }
+    }
+
+    fn factor(ref sys: System, j: List<f64>, h: f64) throws (OdeError) -> (Lu<f64>, Lu<Complex<f64>>) | none {
+        let n = sys.n;
+        sys.nlu += 2;
+        let lr = try linalg::lu(shifted(j, n, MU_REAL / h, 1.0)) catch _ { return none; };
+        let mu = Complex::new(MU_RE, MU_IM) / Complex::new(h, 0.0);
+        let mc = List::filled(n * n, Complex::new(0.0, 0.0));
+        for i in 0..n * n { mc[i] = Complex::new(-j[i], 0.0); }
+        for i in 0..n { mc[i * n + i] = mc[i * n + i] + mu; }
+        let lc = try linalg::lu(Array::view_list(mc, [n, n])) catch _ { return none; };
+        (lr, lc)
+    }
+
+    fn collocation(ref sys: System, t: f64, y: List<f64>, h: f64, z0: List<f64>, scale: List<f64>, tol: f64, lr: Lu<f64>, lc: Lu<Complex<f64>>) throws (OdeError) -> Newton {
+        let n = sys.n;
+        let m_real = MU_REAL / h;
+        let m_cplx = Complex::new(MU_RE, MU_IM) / Complex::new(h, 0.0);
+        let w = List::filled(3 * n, 0.0);
+        for r in 0..3 {
+            for i in 0..3 {
+                let c = TI[r * 3 + i];
+                for m in 0..n { w[r * n + m] += c * z0[i * n + m]; }
+            }
+        }
+        let z = z0;
+        let dw = List::filled(3 * n, 0.0);
+        let sc3 = List::filled(3 * n, 0.0);
+        for r in 0..3 {
+            for m in 0..n { sc3[r * n + m] = scale[m]; }
+        }
+        let norm_old = -1.0;
+        let rate = -1.0;
+        let k = 0usize;
+        let converged = false;
+        while k < NEWTON_MAXITER {
+            let fs: List<List<f64>> = List::with_capacity(3);
+            let ok = true;
+            for i in 0..3 {
+                let yi = List::filled(n, 0.0);
+                for m in 0..n { yi[m] = y[m] + z[i * n + m]; }
+                let fi = try sys.eval(t + C[i] * h, yi);
+                if !finite(fi) { ok = false; }
+                fs.push(fi);
+            }
+            if !ok { break; }
+            let fr = List::filled(n, 0.0);
+            let fc = List::filled(n, Complex::new(0.0, 0.0));
+            for m in 0..n {
+                let (re, a, b) = (0.0, 0.0, 0.0);
+                for i in 0..3 {
+                    let v = fs[i][m];
+                    re += v * TI[i];
+                    a += v * TI[3 + i];
+                    b += v * TI[6 + i];
+                }
+                fr[m] = re - m_real * w[m];
+                fc[m] = Complex::new(a, b) - m_cplx * Complex::new(w[n + m], w[2 * n + m]);
+            }
+            let dr = try lr.solve(Array::view_list(fr, [n])) catch _ { break; };
+            let dc = try lc.solve(Array::view_list(fc, [n])) catch _ { break; };
+            for m in 0..n {
+                dw[m] = dr[m];
+                let c = dc[m];
+                dw[n + m] = c.re;
+                dw[2 * n + m] = c.im;
+            }
+            let dnorm = rms_ratio(dw, sc3);
+            if norm_old >= 0.0 { rate = dnorm / norm_old; }
+            if rate >= 0.0 && (rate >= 1.0 || rate.powi((NEWTON_MAXITER - k) as i32) / (1.0 - rate) * dnorm > tol) {
+                k += 1;
+                break;
+            }
+            for i in 0..3 * n { w[i] += dw[i]; }
+            let zn = List::filled(3 * n, 0.0);
+            for r in 0..3 {
+                for i in 0..3 {
+                    let c = T[r * 3 + i];
+                    if c == 0.0 { continue; }
+                    for m in 0..n { zn[r * n + m] += c * w[i * n + m]; }
+                }
+            }
+            z = zn;
+            k += 1;
+            if dnorm == 0.0 || (rate >= 0.0 && rate / (1.0 - rate) * dnorm < tol) {
+                converged = true;
+                break;
+            }
+            norm_old = dnorm;
+        }
+        Newton { converged: converged, iters: k.max(1), z: z, rate: rate }
+    }
+
+    pub(pkg) fn step(ref self, ref sys: System) throws (OdeError) -> Outcome {
+        let n = sys.n;
+        let (t, y, f) = (self.t, self.y, self.f);
+        let min_step = sys.min_step(t);
+        let (h_abs, h_abs_old, error_norm_old) = (self.h_abs, self.h_abs_old, self.error_norm_old);
+        if self.h_abs > sys.max_step {
+            h_abs = sys.max_step;
+            h_abs_old = -1.0;
+            error_norm_old = -1.0;
+        } else if self.h_abs < min_step {
+            h_abs = min_step;
+            h_abs_old = -1.0;
+            error_norm_old = -1.0;
+        }
+        let j = self.jac;
+        let lus = self.lus;
+        let current_jac = self.current_jac;
+        let rejected = false;
+        let nan = false;
+        loop {
+            if h_abs < min_step { return if nan { Outcome::NotFinite } else { Outcome::TooSmall }; }
+            let t_new = t + h_abs * sys.dir;
+            if sys.dir * (t_new - sys.t_bound) > 0.0 { t_new = sys.t_bound; }
+            let h = t_new - t;
+            h_abs = h.abs();
+            let z0 = List::filled(3 * n, 0.0);
+            match self.sol {
+                p: Piece => {
+                    let v = List::filled(n, 0.0);
+                    for i in 0..3 {
+                        p.eval_into(t + h * C[i], v);
+                        for m in 0..n { z0[i * n + m] = v[m] - y[m]; }
+                    }
+                },
+                none => {},
+            }
+            let scale = sys.scale(y);
+            let res = Newton { converged: false, iters: 0, z: z0, rate: -1.0 };
+            loop {
+                let (a, b) = match lus {
+                    p: (Lu<f64>, Lu<Complex<f64>>) => p,
+                    none => match try Radau::factor(ref sys, j, h) {
+                        p: (Lu<f64>, Lu<Complex<f64>>) => p,
+                        none => break,
+                    },
+                };
+                lus = (a, b);
+                res = try Radau::collocation(ref sys, t, y, h, z0, scale, self.newton_tol, a, b);
+                if res.converged || current_jac || sys.constant_jac() { break; }
+                j = try sys.jacobian(t, y, f);
+                current_jac = true;
+                lus = none;
+            }
+            if !res.converged {
+                h_abs *= 0.5;
+                lus = none;
+                continue;
+            }
+            let (a, _) = match lus {
+                p: (Lu<f64>, Lu<Complex<f64>>) => p,
+                none => return Outcome::TooSmall,
+            };
+            let z = res.z;
+            let y_new = List::filled(n, 0.0);
+            let ze = List::filled(n, 0.0);
+            for m in 0..n {
+                y_new[m] = y[m] + z[2 * n + m];
+                ze[m] = (z[m] * E[0] + z[n + m] * E[1] + z[2 * n + m] * E[2]) / h;
+            }
+            let rhs = List::filled(n, 0.0);
+            for m in 0..n { rhs[m] = f[m] + ze[m]; }
+            let err = try solve(a, rhs);
+            let scale2 = sys.scale2(y, y_new);
+            let en = rms_ratio(err, scale2);
+            let safety = 0.9 * ((2 * NEWTON_MAXITER + 1) as f64) / ((2 * NEWTON_MAXITER + res.iters) as f64);
+            if rejected && en > 1.0 {
+                let ye = List::filled(n, 0.0);
+                for m in 0..n { ye[m] = y[m] + err[m]; }
+                let fe = try sys.eval(t, ye);
+                for m in 0..n { rhs[m] = fe[m] + ze[m]; }
+                err = try solve(a, rhs);
+                en = rms_ratio(err, scale2);
+            }
+            if !(en <= 1.0) {
+                let factor = predict(h_abs, h_abs_old, en, error_norm_old);
+                h_abs *= MIN_FACTOR.max(safety * factor);
+                nan = en.is_nan();
+                if nan { h_abs = 0.5 * h.abs(); }
+                lus = none;
+                rejected = true;
+                continue;
+            }
+            let recompute = !sys.constant_jac() && res.iters > 2 && res.rate > 1e-3;
+            let factor = MAX_FACTOR.min(safety * predict(h_abs, h_abs_old, en, error_norm_old));
+            if !recompute && factor < 1.2 {
+                factor = 1.0;
+            } else {
+                lus = none;
+            }
+            let f_new = try sys.eval(t_new, y_new);
+            if recompute {
+                j = try sys.jacobian(t_new, y_new, f_new);
+                current_jac = true;
+            } else if !sys.constant_jac() {
+                current_jac = false;
+            }
+            self.h_abs_old = self.h_abs;
+            self.error_norm_old = en;
+            self.h_abs = h_abs * factor;
+            self.y_old = y;
+            self.t_old = t;
+            self.t = t_new;
+            self.y = y_new;
+            self.f = f_new;
+            self.z = z;
+            self.lus = lus;
+            self.current_jac = current_jac;
+            self.jac = j;
+            self.sol = self.dense();
+            return Outcome::Accepted;
+        }
+    }
+
+    fn dense(self) -> Piece {
+        let n = self.y.len();
+        let q = List::filled(3 * n, 0.0);
+        for m in 0..n {
+            for c in 0..3 {
+                let acc = 0.0;
+                for i in 0..3 { acc += self.z[i * n + m] * P[i * 3 + c]; }
+                q[m * 3 + c] = acc;
+            }
+        }
+        Piece::Poly { t0: self.t_old, h: self.t - self.t_old, y0: self.y_old, q: q, k: 3 }
+    }
+
+    pub(pkg) fn piece(self) -> Piece {
+        match self.sol {
+            p: Piece => p,
+            none => self.dense(),
+        }
+    }
+}
+
+/// `x` with `A x = b` from the real LU.
+fn solve(lu: Lu<f64>, b: List<f64>) throws (OdeError) -> List<f64> {
+    let n = b.len();
+    let x = try lu.solve(Array::view_list(b, [n])) catch _ { return List::filled(n, f64::NAN); };
+    match x.as_list() {
+        xs: List<f64> => xs,
+        none => x.to_list(),
+    }
+}
+
+/// Gustafsson's predictive step factor (exponent 1/4 for the order-3
+/// error estimate).
+fn predict(h_abs: f64, h_abs_old: f64, en: f64, en_old: f64) -> f64 {
+    let mult = if en_old < 0.0 || h_abs_old < 0.0 || en == 0.0 { 1.0 } else { h_abs / h_abs_old * (en_old / en).pow(0.25) };
+    if en == 0.0 { return MAX_FACTOR; }
+    mult.min(1.0) * en.pow(-0.25)
+}
+
+impl Stepper for Radau {
+    fn time(self) -> f64 { self.t }
+    fn state(self) -> List<f64> { self.y }
+    fn advance(ref self, ref sys: System) throws (OdeError) -> Outcome { try self.step(ref sys) }
+    fn interpolant(ref self, ref sys: System) throws (OdeError) -> Piece { self.piece() }
+}

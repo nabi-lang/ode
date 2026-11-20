@@ -1,0 +1,21 @@
+// Boundary value problems: one solve, mesh refinement included.
+
+use core::array::{Array, Matrix, Vector};
+use core::bench::Bench;
+use core::hint::black_box;
+
+#[bench]
+fn bratu(b: Bench) {
+    let x: Vector<f64> = Array::from(num::linspace(0.0, 1.0, 10));
+    let y: Matrix<f64> = Array::zeros([2, 10]);
+    b.iter(|| try! pkg::solve_bvp(black_box(|x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0].exp()] }), |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0], b[0]] }, x, y, tol: 1e-8));
+}
+
+#[bench]
+fn boundary_layer(b: Bench) {
+    // eps y'' = -y' ... a layer at x = 0: eps y'' + y' = 0, y(0) = 0, y(1) = 1.
+    let x: Vector<f64> = Array::from(num::linspace(0.0, 1.0, 10));
+    let y: Matrix<f64> = Array::zeros([2, 10]);
+    let eps = 1e-3;
+    b.iter(|| try! pkg::solve_bvp(black_box(|x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[1] / eps] }), |a: Vector<f64>, b: Vector<f64>| -> Vector<f64> { [a[0], b[0] - 1.0] }, x, y, tol: 1e-6, max_nodes: 10000));
+}

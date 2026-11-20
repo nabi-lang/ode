@@ -1,0 +1,273 @@
+// Explicit embedded Runge-Kutta pairs with local extrapolation and the
+// step control of Hairer, Norsett and Wanner (Solving ODEs I, II.4):
+// Bogacki-Shampine 3(2) (1989), Dormand-Prince 5(4) (1980) with
+// Shampine's 4th order dense output (1986), and Hairer's DOP853, an
+// 8(5,3) pair with a 7th degree interpolant (three extra stages per
+// step, taken only when dense output is asked for). The step factor is
+// `0.9 err^(-1 / (p + 1))`, held in [0.2, 10], never above 1 right after
+// a rejection. Cost per step: `s` evaluations of `f` (3, 6, 12; the last
+// stage is reused) and O(s^2 n) flops.
+
+use pkg::Method;
+use pkg::OdeError;
+use pkg::dense::Piece;
+use pkg::ivp::dop853;
+use pkg::ivp::system::{Outcome, Stepper, System, rms_ratio};
+
+const SAFETY: f64 = 0.9;
+const MIN_FACTOR: f64 = 0.2;
+const MAX_FACTOR: f64 = 10.0;
+
+pub(pkg) struct Rk {
+    kind: Method;
+    /// Stages; the derivative at the new point is stage `s`.
+    s: usize;
+    /// Row stride of `a`.
+    ka: usize;
+    a: List<f64>;
+    b: List<f64>;
+    c: List<f64>;
+    e: List<f64>;
+    /// Dense output matrix, `(s + 1) x kp`.
+    p: List<f64>;
+    kp: usize;
+    /// Error order of the embedded pair.
+    pub(pkg) order: f64;
+    pub(pkg) t: f64;
+    pub(pkg) y: List<f64>;
+    pub(pkg) f: List<f64>;
+    pub(pkg) h_abs: f64;
+    k: List<List<f64>>;
+    t_old: f64;
+    y_old: List<f64>;
+    h: f64;
+    /// `|h| lambda` of the last step, from stages 6 and 7 of RK45
+    /// (Hairer's stiffness test); 0 for the other pairs.
+    pub(pkg) stiff_ratio: f64;
+    ysti: List<f64>;
+    /// The last rejected try gave NaN.
+    pub(pkg) nan: bool;
+}
+
+impl Rk {
+    pub(pkg) fn new(kind: Method, ref sys: System, t0: f64, y0: List<f64>, f0: List<f64>, first_step: f64) throws (OdeError) -> Rk {
+        let r = match kind {
+            Method::Rk23 => Rk {
+                kind: kind, s: 3, ka: 3,
+                a: [0.0, 0.0, 0.0, 1.0 / 2.0, 0.0, 0.0, 0.0, 3.0 / 4.0, 0.0],
+                b: [2.0 / 9.0, 1.0 / 3.0, 4.0 / 9.0],
+                c: [0.0, 1.0 / 2.0, 3.0 / 4.0],
+                e: [5.0 / 72.0, -1.0 / 12.0, -1.0 / 9.0, 1.0 / 8.0],
+                p: [1.0, -4.0 / 3.0, 5.0 / 9.0, 0.0, 1.0, -2.0 / 3.0, 0.0, 4.0 / 3.0, -8.0 / 9.0, 0.0, -1.0, 1.0],
+                kp: 3, order: 2.0,
+                t: t0, y: y0, f: f0, h_abs: 0.0, k: [], t_old: t0, y_old: y0, h: 0.0, stiff_ratio: 0.0, ysti: [], nan: false,
+            },
+            Method::Dop853 => Rk {
+                kind: kind, s: 12, ka: 16,
+                a: table(dop853::A), b: table(dop853::B), c: table(dop853::C),
+                e: [], p: [], kp: 0, order: 7.0,
+                t: t0, y: y0, f: f0, h_abs: 0.0, k: [], t_old: t0, y_old: y0, h: 0.0, stiff_ratio: 0.0, ysti: [], nan: false,
+            },
+            _ => Rk {
+                kind: Method::Rk45, s: 6, ka: 6,
+                a: [
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    1.0 / 5.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    3.0 / 40.0, 9.0 / 40.0, 0.0, 0.0, 0.0, 0.0,
+                    44.0 / 45.0, -56.0 / 15.0, 32.0 / 9.0, 0.0, 0.0, 0.0,
+                    19372.0 / 6561.0, -25360.0 / 2187.0, 64448.0 / 6561.0, -212.0 / 729.0, 0.0, 0.0,
+                    9017.0 / 3168.0, -355.0 / 33.0, 46732.0 / 5247.0, 49.0 / 176.0, -5103.0 / 18656.0, 0.0,
+                ],
+                b: [35.0 / 384.0, 0.0, 500.0 / 1113.0, 125.0 / 192.0, -2187.0 / 6784.0, 11.0 / 84.0],
+                c: [0.0, 1.0 / 5.0, 3.0 / 10.0, 4.0 / 5.0, 8.0 / 9.0, 1.0],
+                e: [-71.0 / 57600.0, 0.0, 71.0 / 16695.0, -71.0 / 1920.0, 17253.0 / 339200.0, -22.0 / 525.0, 1.0 / 40.0],
+                // Shampine's interpolant with the optimal c6.
+                p: [
+                    1.0, -8048581381.0 / 2820520608.0, 8663915743.0 / 2820520608.0, -12715105075.0 / 11282082432.0,
+                    0.0, 0.0, 0.0, 0.0,
+                    0.0, 131558114200.0 / 32700410799.0, -68118460800.0 / 10900136933.0, 87487479700.0 / 32700410799.0,
+                    0.0, -1754552775.0 / 470086768.0, 14199869525.0 / 1410260304.0, -10690763975.0 / 1880347072.0,
+                    0.0, 127303824393.0 / 49829197408.0, -318862633887.0 / 49829197408.0, 701980252875.0 / 199316789632.0,
+                    0.0, -282668133.0 / 205662961.0, 2019193451.0 / 616988883.0, -1453857185.0 / 822651844.0,
+                    0.0, 40617522.0 / 29380423.0, -110615467.0 / 29380423.0, 69997945.0 / 29380423.0,
+                ],
+                kp: 4, order: 4.0,
+                t: t0, y: y0, f: f0, h_abs: 0.0, k: [], t_old: t0, y_old: y0, h: 0.0, stiff_ratio: 0.0, ysti: [], nan: false,
+            },
+        };
+        let stages = if r.kind == Method::Dop853 { 16 } else { r.s + 1 };
+        for _ in 0..stages { r.k.push(List::filled(sys.n, 0.0)); }
+        r.h_abs = if first_step > 0.0 { first_step } else { try sys.initial_step(t0, y0, f0, r.order) };
+        r
+    }
+
+    /// The stages of a step of size `h` from `(t, y)`; the new point.
+    fn stages(ref self, ref sys: System, h: f64) throws (OdeError) -> List<f64> {
+        let n = sys.n;
+        let (s, ka) = (self.s, self.ka);
+        self.k[0] = self.f;
+        for i in 1..s {
+            let yi = self.y.clone();
+            for j in 0..i {
+                let a = self.a[i * ka + j];
+                if a == 0.0 { continue; }
+                let w = h * a;
+                let kj = self.k[j];
+                for m in 0..n { yi[m] += w * kj[m]; }
+            }
+            if i == 5 && self.kind == Method::Rk45 { self.ysti = yi; }
+            self.k[i] = try sys.eval(self.t + self.c[i] * h, yi);
+        }
+        let y_new = self.y.clone();
+        for j in 0..s {
+            let b = self.b[j];
+            if b == 0.0 { continue; }
+            let w = h * b;
+            let kj = self.k[j];
+            for m in 0..n { y_new[m] += w * kj[m]; }
+        }
+        self.k[s] = try sys.eval(self.t + h, y_new);
+        y_new
+    }
+
+    /// The scaled error norm of the step just computed.
+    fn error_norm(self, h: f64, sc: List<f64>) -> f64 {
+        let n = sc.len();
+        if n == 0 { return 0.0; }
+        if self.kind == Method::Dop853 {
+            let (e5, e3) = (0.0, 0.0);
+            for m in 0..n {
+                let (a5, a3) = (0.0, 0.0);
+                for j in 0..13 {
+                    let v = self.k[j][m];
+                    a5 += dop853::E5[j] * v;
+                    a3 += dop853::E3[j] * v;
+                }
+                a5 /= sc[m];
+                a3 /= sc[m];
+                e5 += a5 * a5;
+                e3 += a3 * a3;
+            }
+            if e5 == 0.0 && e3 == 0.0 { return 0.0; }
+            return h.abs() * e5 / ((e5 + 0.01 * e3) * (n as f64)).sqrt();
+        }
+        let err = List::filled(n, 0.0);
+        for j in 0..self.s + 1 {
+            let w = h * self.e[j];
+            if w == 0.0 { continue; }
+            let kj = self.k[j];
+            for m in 0..n { err[m] += w * kj[m]; }
+        }
+        rms_ratio(err, sc)
+    }
+
+    /// One accepted step, or the reason none could be taken.
+    pub(pkg) fn step(ref self, ref sys: System) throws (OdeError) -> Outcome {
+        let t = self.t;
+        let min_step = sys.min_step(t);
+        let h_abs = if self.h_abs > sys.max_step { sys.max_step } else if self.h_abs < min_step { min_step } else { self.h_abs };
+        let exponent = -1.0 / (self.order + 1.0);
+        let rejected = false;
+        loop {
+            if h_abs < min_step { return if self.nan { Outcome::NotFinite } else { Outcome::TooSmall }; }
+            let t_new = t + h_abs * sys.dir;
+            if sys.dir * (t_new - sys.t_bound) > 0.0 { t_new = sys.t_bound; }
+            let h = t_new - t;
+            h_abs = h.abs();
+            let y_new = try self.stages(ref sys, h);
+            let en = self.error_norm(h, sys.scale2(self.y, y_new));
+            if en < 1.0 {
+                let factor = if en == 0.0 { MAX_FACTOR } else { MAX_FACTOR.min(SAFETY * en.pow(exponent)) };
+                if rejected { factor = factor.min(1.0); }
+                if self.kind == Method::Rk45 { self.stiff_ratio = stiffness(h, self.k[6], self.k[5], y_new, self.ysti); }
+                self.h = h;
+                self.t_old = t;
+                self.y_old = self.y;
+                self.t = t_new;
+                self.y = y_new;
+                self.f = self.k[self.s];
+                self.h_abs = h_abs * factor;
+                self.nan = false;
+                return Outcome::Accepted;
+            }
+            // NaN fails every comparison: shrink hard and remember why.
+            self.nan = !(en >= 1.0);
+            h_abs *= if self.nan { MIN_FACTOR } else { MIN_FACTOR.max(SAFETY * en.pow(exponent)) };
+            rejected = true;
+        }
+    }
+
+    /// The interpolant of the last step.
+    pub(pkg) fn piece(ref self, ref sys: System) throws (OdeError) -> Piece {
+        let n = sys.n;
+        let h = self.h;
+        if self.kind != Method::Dop853 {
+            let (kp, s) = (self.kp, self.s);
+            let q = List::filled(n * kp, 0.0);
+            for r in 0..s + 1 {
+                let kr = self.k[r];
+                for j in 0..kp {
+                    let w = h * self.p[r * kp + j];
+                    if w == 0.0 { continue; }
+                    for m in 0..n { q[m * kp + j] += w * kr[m]; }
+                }
+            }
+            return Piece::Poly { t0: self.t_old, h: h, y0: self.y_old, q: q, k: kp };
+        }
+        for st in 13..16 {
+            let yi = self.y_old.clone();
+            for j in 0..st {
+                let a = dop853::A[st * 16 + j];
+                if a == 0.0 { continue; }
+                let w = h * a;
+                let kj = self.k[j];
+                for m in 0..n { yi[m] += w * kj[m]; }
+            }
+            self.k[st] = try sys.eval(self.t_old + dop853::C[st] * h, yi);
+        }
+        let f = List::filled(7 * n, 0.0);
+        let (f_old, f_new) = (self.k[0], self.k[12]);
+        for m in 0..n {
+            let dy = self.y[m] - self.y_old[m];
+            f[m] = dy;
+            f[n + m] = h * f_old[m] - dy;
+            f[2 * n + m] = 2.0 * dy - h * (f_new[m] + f_old[m]);
+        }
+        for r in 0..4 {
+            for j in 0..16 {
+                let w = h * dop853::D[r * 16 + j];
+                if w == 0.0 { continue; }
+                let kj = self.k[j];
+                for m in 0..n { f[(3 + r) * n + m] += w * kj[m]; }
+            }
+        }
+        Piece::Dop { t0: self.t_old, h: h, y0: self.y_old, f: f }
+    }
+}
+
+/// A const table as a list.
+fn table<const N: usize>(a: [f64; N]) -> List<f64> {
+    let l = List::with_capacity(N);
+    for v in a { l.push(v); }
+    l
+}
+
+/// `|h| sqrt(sum (k7 - k6)^2 / sum (y7 - y6)^2)`: both stages sit at
+/// `t + h`, so the ratio estimates the dominant eigenvalue times `h`.
+fn stiffness(h: f64, k7: List<f64>, k6: List<f64>, y7: List<f64>, y6: List<f64>) -> f64 {
+    let (num, den) = (0.0, 0.0);
+    for m in 0..k7.len() {
+        let a = k7[m] - k6[m];
+        let b = y7[m] - y6[m];
+        num += a * a;
+        den += b * b;
+    }
+    if den > 0.0 { h.abs() * (num / den).sqrt() } else { 0.0 }
+}
+
+impl Stepper for Rk {
+    fn time(self) -> f64 { self.t }
+    fn state(self) -> List<f64> { self.y }
+    fn advance(ref self, ref sys: System) throws (OdeError) -> Outcome { try self.step(ref sys) }
+    fn interpolant(ref self, ref sys: System) throws (OdeError) -> Piece { try self.piece(ref sys) }
+}

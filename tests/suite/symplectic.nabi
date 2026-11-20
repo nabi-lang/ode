@@ -1,0 +1,95 @@
+use pkg::Symplectic;
+use pkg::tests::suite::{close, expect, order_near};
+use core::array::Vector;
+
+const TAU: f64 = 6.283185307179586;
+
+/// The largest energy error in the first and the last tenth of a run.
+fn drift(e: Vector<f64>, e0: f64) -> (f64, f64) {
+    let m = e.len();
+    let (a, b) = (0.0, 0.0);
+    for j in 0..m / 10 { a = a.max((e[j] - e0).abs()); }
+    for j in m - m / 10..m { b = b.max((e[j] - e0).abs()); }
+    (a, b)
+}
+
+#[test]
+fn kepler_energy_bounded() {
+    // e = 0.5, 1000 periods, 400 steps per period.
+    let (force, q0, p0, energy) = pkg::problems::kepler(0.5);
+    for m in [Symplectic::Verlet, Symplectic::Leapfrog, Symplectic::Yoshida4] {
+        let o = try! pkg::symplectic(|p: Vector<f64>| -> Vector<f64> { p }, force, q0, p0, 0.0..1000.0 * TAU, 400000, method: m, every: 100);
+        let (early, late) = drift(o.energy(energy), -0.5);
+        let bound = if m == Symplectic::Yoshida4 { 1e-6 } else { 2e-3 };
+        expect(late < bound && early < bound, f"{m:?} energy error {early} early, {late} late");
+        // No secular drift: the late error stays on the scale of the early one.
+        expect(late < 3.0 * early + 1e-12, f"{m:?} energy drifts: {early} -> {late}");
+        // Angular momentum q x p is a quadratic invariant: kept to rounding.
+        let (q, p) = (o.last_q(), o.last_p());
+        close(q[0] * p[1] - q[1] * p[0], q0[0] * p0[1], 1e-9, f"{m:?} angular momentum");
+    }
+}
+
+#[test]
+fn rk4_drifts_where_verlet_does_not() {
+    // RK4's energy error grows with time (here ten times over ten times
+    // the periods); velocity Verlet's stays put.
+    let (force, q0, p0, energy) = pkg::problems::kepler(0.5);
+    let y0: Vector<f64> = [q0[0], q0[1], p0[0], p0[1]];
+    let f = |t: f64, y: Vector<f64>| -> Vector<f64> {
+        let a = force([y[0], y[1]]);
+        [y[2], y[3], a[0], a[1]]
+    };
+    let errs: List<f64> = [];
+    for periods in [20.0, 200.0] {
+        let r = try! pkg::rk4(f, 0.0..periods * TAU, y0, (periods * 200.0) as usize);
+        let l = r.last();
+        errs.push((energy([l[0], l[1]], [l[2], l[3]]) + 0.5).abs());
+    }
+    expect(errs[1] > 5.0 * errs[0], f"RK4 energy error grows: {errs:?}");
+    let v: List<f64> = [];
+    for periods in [20.0, 200.0] {
+        let o = try! pkg::verlet(force, q0, p0, 0.0..periods * TAU, (periods * 200.0) as usize, every: 1000000);
+        v.push((energy(o.last_q(), o.last_p()) + 0.5).abs());
+    }
+    expect(v[1] < 2.0 * v[0] + 1e-12, f"Verlet energy error stays: {v:?}");
+}
+
+#[test]
+fn symplectic_orders() {
+    // Pendulum to t = 2 against a fine Yoshida6 run.
+    let q0: Vector<f64> = [1.0];
+    let p0: Vector<f64> = [0.0];
+    let v = |p: Vector<f64>| -> Vector<f64> { p };
+    let f = |q: Vector<f64>| -> Vector<f64> { [-q[0].sin()] };
+    let exact = (try! pkg::symplectic(v, f, q0, p0, 0.0..2.0, 4000, method: Symplectic::Yoshida6)).last_q()[0];
+    for c in [(Symplectic::Euler, 100usize), (Symplectic::Verlet, 50usize), (Symplectic::Leapfrog, 50usize), (Symplectic::Yoshida4, 25usize), (Symplectic::Yoshida6, 10usize)] {
+        let (m, n) = c;
+        let e1 = ((try! pkg::symplectic(v, f, q0, p0, 0.0..2.0, n, method: m)).last_q()[0] - exact).abs();
+        let e2 = ((try! pkg::symplectic(v, f, q0, p0, 0.0..2.0, 2 * n, method: m)).last_q()[0] - exact).abs();
+        order_near(e1, e2, m.order() as f64, 0.3, f"{m:?}");
+    }
+}
+
+#[test]
+fn time_reversible() {
+    // Verlet forward then backward returns to the start to rounding.
+    let (force, q0, p0, _) = pkg::problems::kepler(0.3);
+    let o = try! pkg::verlet(force, q0, p0, 0.0..10.0, 1000);
+    let back = try! pkg::verlet(force, o.last_q(), o.last_p(), 10.0..0.0, 1000);
+    close(back.last_q()[0], q0[0], 1e-11, "q back");
+    close(back.last_p()[1], p0[1], 1e-11, "p back");
+    expect(o.nfev == 1001, f"one force evaluation per step: {o.nfev}");
+}
+
+#[test]
+fn nbody_momentum() {
+    // Three bodies: total momentum stays zero, energy stays near its start.
+    let mass: List<f64> = [1.0, 1.0, 1.0];
+    let a = pkg::problems::gravity(mass, 0.0);
+    let q0: Vector<f64> = [-1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5, 0.0];
+    let v0: Vector<f64> = [0.0, -0.3, 0.1, 0.0, 0.3, -0.1, 0.0, 0.0, 0.0];
+    let o = try! pkg::leapfrog(a, q0, v0, 0.0..10.0, 20000, every: 20000);
+    let v = o.last_p();
+    for k in 0..3 { close(v[k] + v[3 + k] + v[6 + k], 0.0, 1e-12, f"momentum {k}"); }
+}

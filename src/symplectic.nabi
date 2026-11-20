@@ -1,0 +1,294 @@
+// Symplectic integrators for separable Hamiltonians H(q, p) = T(p) +
+// V(q): q' = dT/dp, p' = -dV/dq (Hairer, Lubich and Wanner, Geometric
+// Numerical Integration, 2006, II and V). They keep the phase-space
+// volume, so the energy error stays bounded, O(h^order), for
+// exponentially long times instead of drifting; time-reversible ones
+// (all but symplectic Euler) also keep it free of secular growth.
+// Yoshida's methods (Yoshida 1990) are symmetric compositions of
+// velocity Verlet, w1 Verlet(h) . w0 . w1 for order 4 and the 7-stage
+// solution A for order 6; each stage costs one force evaluation.
+
+use pkg::OdeError;
+use core::array::{Array, Matrix, Vector};
+use core::range::Range;
+use linalg::AsVector;
+
+/// A symplectic method for `symplectic`.
+///
+/// | method       | order | force evaluations per step |
+/// |--------------|-------|----------------------------|
+/// | `Euler`      | 1     | 1                          |
+/// | `Verlet`     | 2     | 1 (kick-drift-kick)        |
+/// | `Leapfrog`   | 2     | 1 (drift-kick-drift)       |
+/// | `Yoshida4`   | 4     | 3                          |
+/// | `Yoshida6`   | 6     | 7                          |
+///
+/// ```nabi
+/// assert(ode::Symplectic::Yoshida4.order() == 4);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Symplectic {
+    /// Symplectic Euler: kick, then drift.
+    Euler,
+    /// Velocity Verlet (Stormer-Verlet, kick-drift-kick).
+    Verlet,
+    /// Position Verlet (drift-kick-drift).
+    Leapfrog,
+    /// Yoshida's 4th order composition (Forest-Ruth).
+    Yoshida4,
+    /// Yoshida's 6th order composition, solution A.
+    Yoshida6,
+}
+
+impl Symplectic {
+    /// The order of accuracy.
+    ///
+    /// ```nabi
+    /// assert(ode::Symplectic::Leapfrog.order() == 2);
+    /// ```
+    pub fn order(self) -> usize {
+        match self {
+            Symplectic::Euler => 1,
+            Symplectic::Verlet => 2,
+            Symplectic::Leapfrog => 2,
+            Symplectic::Yoshida4 => 4,
+            Symplectic::Yoshida6 => 6,
+        }
+    }
+
+    /// Verlet stage weights of the composition.
+    fn weights(self) -> List<f64> {
+        match self {
+            Symplectic::Yoshida4 => {
+                let c = 2.0f64.cbrt();
+                let w1 = 1.0 / (2.0 - c);
+                [w1, -c * w1, w1]
+            },
+            Symplectic::Yoshida6 => {
+                let (w1, w2, w3) = (0.78451361047755726382, 0.23557321335935813368, -1.17767998417887100695);
+                let w0 = 1.0 - 2.0 * (w1 + w2 + w3);
+                [w1, w2, w3, w0, w3, w2, w1]
+            },
+            _ => [1.0],
+        }
+    }
+}
+
+/// A trajectory from `symplectic`: positions `q` and momenta `p` as
+/// columns (`[d, t.len()]`) at the saved times `t`.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let q0: Vector<f64> = [1.0];
+/// let v0: Vector<f64> = [0.0];
+/// let o = try ode::verlet(|q: Vector<f64>| -> Vector<f64> { -q }, q0, v0, 0.0..10.0, 1000);
+/// let e = o.energy(|q: Vector<f64>, p: Vector<f64>| -> f64 { 0.5 * (q[0] * q[0] + p[0] * p[0]) });
+/// assert(o.q.shape() == [1, 1001] && (e[1000] - 0.5).abs() < 1e-5);
+/// ```
+#[derive(Clone)]
+pub struct Orbit {
+    /// Saved times.
+    pub t: Vector<f64>;
+    /// Positions, `[d, t.len()]`.
+    pub q: Matrix<f64>;
+    /// Momenta (velocities for `verlet` and friends), `[d, t.len()]`.
+    pub p: Matrix<f64>;
+    /// Force evaluations.
+    pub nfev: usize;
+}
+
+impl Orbit {
+    /// `h(q, p)` at every saved time: the energy for a Hamiltonian `h`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let q0: Vector<f64> = [1.0];
+    /// let v0: Vector<f64> = [0.0];
+    /// let o = try ode::verlet(|q: Vector<f64>| -> Vector<f64> { -q }, q0, v0, 0.0..1.0, 100);
+    /// let e = o.energy(|q: Vector<f64>, p: Vector<f64>| -> f64 { 0.5 * (q[0] * q[0] + p[0] * p[0]) });
+    /// assert(e.len() == 101 && e[0] == 0.5);
+    /// ```
+    pub fn energy(self, h: fn(Vector<f64>, Vector<f64>) -> f64) -> Vector<f64> {
+        let m = self.t.len();
+        let out = List::filled(m, 0.0);
+        for j in 0..m { out[j] = h(self.q[:, j].copy(), self.p[:, j].copy()); }
+        Array::view_list(out, [m])
+    }
+
+    /// The final positions.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let q0: Vector<f64> = [1.0];
+    /// let v0: Vector<f64> = [0.0];
+    /// let o = try ode::verlet(|q: Vector<f64>| -> Vector<f64> { -q }, q0, v0, 0.0..1.0, 100);
+    /// assert((o.last_q()[0] - 1.0f64.cos()).abs() < 1e-4);
+    /// ```
+    pub fn last_q(self) -> Vector<f64> { self.q[:, self.t.len() - 1].copy() }
+
+    /// The final momenta.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let q0: Vector<f64> = [1.0];
+    /// let v0: Vector<f64> = [0.0];
+    /// let o = try ode::verlet(|q: Vector<f64>| -> Vector<f64> { -q }, q0, v0, 0.0..1.0, 100);
+    /// assert((o.last_p()[0] + 1.0f64.sin()).abs() < 1e-4);
+    /// ```
+    pub fn last_p(self) -> Vector<f64> { self.p[:, self.t.len() - 1].copy() }
+}
+
+fn eval(g: fn(Vector<f64>) -> Vector<f64>, x: List<f64>, what: str, ref count: usize) throws (OdeError) -> List<f64> {
+    count += 1;
+    let n = x.len();
+    let v = g(Array::view_list(x, [n]));
+    if v.len() != n { throw OdeError::LengthMismatch { what: f"{what} returned {v.len()} values for {n} coordinates; return one per coordinate" }; }
+    match v.as_list() {
+        xs: List<f64> => xs,
+        none => v.to_list(),
+    }
+}
+
+/// `x + w v` as a new list.
+fn moved(x: List<f64>, w: f64, v: List<f64>) -> List<f64> {
+    let r = x.clone();
+    for m in 0..r.len() { r[m] += w * v[m]; }
+    r
+}
+
+/// Integrates the separable Hamiltonian system `q' = velocity(p)`
+/// (`dT/dp`), `p' = force(q)` (`-dV/dq`) over `span` in `steps` equal
+/// steps, saving every `every`-th step (and the last).
+///
+/// ```nabi
+/// use ode::Symplectic;
+/// use core::array::Vector;
+///
+/// // A pendulum, H = p^2 / 2 - cos q.
+/// let q0: Vector<f64> = [1.0];
+/// let p0: Vector<f64> = [0.0];
+/// let o = try ode::symplectic(|p: Vector<f64>| -> Vector<f64> { p }, |q: Vector<f64>| -> Vector<f64> { [-q[0].sin()] }, q0, p0, 0.0..100.0, 2000, method: Symplectic::Yoshida4);
+/// let e = o.energy(|q: Vector<f64>, p: Vector<f64>| -> f64 { 0.5 * p[0] * p[0] - q[0].cos() });
+/// assert((e[e.len() - 1] - e[0]).abs() < 1e-6);
+/// ```
+pub fn symplectic(
+    velocity: fn(Vector<f64>) -> Vector<f64>,
+    force: fn(Vector<f64>) -> Vector<f64>,
+    q0: Vector<f64>,
+    p0: Vector<f64>,
+    span: Range<f64>,
+    steps: usize,
+    method: Symplectic = Symplectic::Verlet,
+    every: usize = 1,
+) throws (OdeError) -> Orbit {
+    let (t0, t1) = (span.start, span.end);
+    if !t0.is_finite() || !t1.is_finite() { throw OdeError::BadArgument { what: f"the span {t0}..{t1} must have finite ends" }; }
+    if steps == 0 { throw OdeError::BadArgument { what: "steps must be at least 1; pass the number of equal steps across the span, such as `1000`" }; }
+    if every == 0 { throw OdeError::BadArgument { what: "every must be at least 1 (1 saves every step)" }; }
+    let d = q0.len();
+    if p0.len() != d { throw OdeError::LengthMismatch { what: f"q0 has {d} coordinates and p0 {p0.len()}; pass one momentum per coordinate" }; }
+    let (q, p) = (q0.to_list(), p0.to_list());
+    for v in q {
+        if !v.is_finite() { throw OdeError::NotFinite { what: "q0" }; }
+    }
+    for v in p {
+        if !v.is_finite() { throw OdeError::NotFinite { what: "p0" }; }
+    }
+    let h = (t1 - t0) / (steps as f64);
+    let nfev = 0usize;
+    let nvel = 0usize;
+    let ts: List<f64> = [t0];
+    let qs: List<List<f64>> = [q];
+    let ps: List<List<f64>> = [p];
+    let ws = method.weights();
+    let fq = try eval(force, q, "force(q)", ref nfev);
+    for i in 0..steps {
+        match method {
+            Symplectic::Euler => {
+                p = moved(p, h, fq);
+                q = moved(q, h, try eval(velocity, p, "velocity(p)", ref nvel));
+                fq = try eval(force, q, "force(q)", ref nfev);
+            },
+            Symplectic::Leapfrog => {
+                let qh = moved(q, 0.5 * h, try eval(velocity, p, "velocity(p)", ref nvel));
+                p = moved(p, h, try eval(force, qh, "force(q)", ref nfev));
+                q = moved(qh, 0.5 * h, try eval(velocity, p, "velocity(p)", ref nvel));
+            },
+            _ => {
+                for w in ws {
+                    let ph = moved(p, 0.5 * w * h, fq);
+                    q = moved(q, w * h, try eval(velocity, ph, "velocity(p)", ref nvel));
+                    fq = try eval(force, q, "force(q)", ref nfev);
+                    p = moved(ph, 0.5 * w * h, fq);
+                }
+            },
+        }
+        if (i + 1) % every == 0 || i + 1 == steps {
+            ts.push(if i + 1 == steps { t1 } else { t0 + ((i + 1) as f64) * h });
+            qs.push(q);
+            ps.push(p);
+        }
+    }
+    let m = ts.len();
+    let (qd, pd) = (List::filled(d * m, 0.0), List::filled(d * m, 0.0));
+    for j in 0..m {
+        for i in 0..d {
+            qd[i * m + j] = qs[j][i];
+            pd[i * m + j] = ps[j][i];
+        }
+    }
+    Orbit { t: Array::from_list(ts, [m]), q: Array::view_list(qd, [d, m]), p: Array::view_list(pd, [d, m]), nfev: nfev }
+}
+
+/// Velocity Verlet for `q'' = accel(q)`: `symplectic` with unit mass,
+/// `p` the velocity.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let q0: Vector<f64> = [0.0];
+/// let v0: Vector<f64> = [1.0];
+/// let o = try ode::verlet(|q: Vector<f64>| -> Vector<f64> { [0.0] }, q0, v0, 0.0..2.0, 10);
+/// assert((o.last_q()[0] - 2.0).abs() < 1e-14);
+/// ```
+pub fn verlet<Q: AsVector<f64>, V: AsVector<f64>>(accel: fn(Vector<f64>) -> Vector<f64>, q0: Q, v0: V, span: Range<f64>, steps: usize, every: usize = 1) throws (OdeError) -> Orbit {
+    let q0: Vector<f64> = q0.as_vector();
+    let v0: Vector<f64> = v0.as_vector();
+    try symplectic(|v: Vector<f64>| -> Vector<f64> { v }, accel, q0, v0, span, steps, method: Symplectic::Verlet, every: every)
+}
+
+/// Leapfrog (drift-kick-drift) for `q'' = accel(q)`, unit mass.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let q0: Vector<f64> = [0.0];
+/// let v0: Vector<f64> = [0.0];
+/// let o = try ode::leapfrog(|q: Vector<f64>| -> Vector<f64> { [-9.81] }, q0, v0, 0.0..1.0, 4);
+/// assert((o.last_q()[0] + 0.5 * 9.81).abs() < 1e-12);   // exact for constant force
+/// ```
+pub fn leapfrog<Q: AsVector<f64>, V: AsVector<f64>>(accel: fn(Vector<f64>) -> Vector<f64>, q0: Q, v0: V, span: Range<f64>, steps: usize, every: usize = 1) throws (OdeError) -> Orbit {
+    let q0: Vector<f64> = q0.as_vector();
+    let v0: Vector<f64> = v0.as_vector();
+    try symplectic(|v: Vector<f64>| -> Vector<f64> { v }, accel, q0, v0, span, steps, method: Symplectic::Leapfrog, every: every)
+}
+
+/// Yoshida's 4th order method for `q'' = accel(q)`, unit mass.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let q0: Vector<f64> = [1.0];
+/// let v0: Vector<f64> = [0.0];
+/// let o = try ode::yoshida4(|q: Vector<f64>| -> Vector<f64> { -q }, q0, v0, 0.0..1.0, 50);
+/// assert((o.last_q()[0] - 1.0f64.cos()).abs() < 1e-8);
+/// ```
+pub fn yoshida4<Q: AsVector<f64>, V: AsVector<f64>>(accel: fn(Vector<f64>) -> Vector<f64>, q0: Q, v0: V, span: Range<f64>, steps: usize, every: usize = 1) throws (OdeError) -> Orbit {
+    let q0: Vector<f64> = q0.as_vector();
+    let v0: Vector<f64> = v0.as_vector();
+    try symplectic(|v: Vector<f64>| -> Vector<f64> { v }, accel, q0, v0, span, steps, method: Symplectic::Yoshida4, every: every)
+}

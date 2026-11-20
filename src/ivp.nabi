@@ -1,0 +1,358 @@
+// Initial value problems `y' = f(t, y)`, `y(t0) = y0`: method choice,
+// input checks and the driver that runs a method over the span, fills
+// the output, the dense output and the event lists.
+
+pub(pkg) mod auto;
+pub(pkg) mod bdf;
+pub(pkg) mod dop853;
+pub(pkg) mod events;
+pub(pkg) mod radau;
+pub(pkg) mod rk;
+pub(pkg) mod rodas;
+pub(pkg) mod system;
+
+use pkg::dense::Dense;
+use pkg::ivp::auto::Auto;
+use pkg::ivp::bdf::Bdf;
+use pkg::ivp::radau::Radau;
+use pkg::ivp::rk::Rk;
+use pkg::ivp::rodas::Rodas;
+use pkg::ivp::system::{Outcome, Stepper, System, finite};
+use pkg::{Event, OdeError, Solution, Status};
+use core::array::{Array, Matrix, Vector};
+use core::range::Range;
+use linalg::AsVector;
+
+/// An integration method for `solve_ivp`.
+///
+/// | method    | kind               | order | use for                                     |
+/// |-----------|--------------------|-------|---------------------------------------------|
+/// | `Rk23`    | explicit RK 3(2)   | 3     | loose tolerances, cheap `f`                 |
+/// | `Rk45`    | explicit RK 5(4)   | 5     | the default for non-stiff problems          |
+/// | `Dop853`  | explicit RK 8(5,3) | 8     | tight tolerances, smooth non-stiff problems |
+/// | `Radau`   | implicit RK (IIA)  | 5     | stiff problems, tight tolerances            |
+/// | `Bdf`     | multistep (NDF)    | 1-5   | stiff problems, large systems               |
+/// | `Rodas`   | Rosenbrock 4(3)    | 4     | stiff problems, moderate tolerances, small n |
+/// | `Auto`    | RK45 / BDF switch  | 5/1-5 | stiffness unknown or changing               |
+///
+/// ```nabi
+/// use ode::Method;
+/// use core::array::Vector;
+///
+/// let y0: Vector<f64> = [1.0];
+/// for m in [Method::Rk23, Method::Rk45, Method::Dop853, Method::Radau, Method::Bdf, Method::Rodas, Method::Auto] {
+///     let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { -y }, 0.0..1.0, y0, method: m, rtol: 1e-8, atol: 1e-10);
+///     assert((r.last()[0] - (-1.0f64).exp()).abs() < 1e-6);
+/// }
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Method {
+    /// Bogacki-Shampine 3(2), cubic dense output.
+    Rk23,
+    /// Dormand-Prince 5(4), quartic dense output.
+    Rk45,
+    /// Hairer's DOP853, 8th order with 7th degree dense output.
+    Dop853,
+    /// Radau IIA, 5th order, L-stable; cubic dense output.
+    Radau,
+    /// Variable-order BDF (NDF form), orders 1 to 5.
+    Bdf,
+    /// The Rosenbrock method RODAS, order 4, L-stable; cubic dense
+    /// output. A fresh Jacobian each step, no Newton iteration.
+    Rodas,
+    /// RK45 while non-stiff, BDF while stiff, switching on its own.
+    Auto,
+}
+
+/// Where the implicit methods get `df/dy`.
+///
+/// ```nabi
+/// use ode::{Jacobian, Method};
+/// use core::array::{Matrix, Vector};
+///
+/// let k = 50.0;
+/// let y0: Vector<f64> = [1.0];
+/// let jac = Jacobian::Exact(|t: f64, y: Vector<f64>| -> Matrix<f64> { [[-k]] });
+/// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y .* -k }, 0.0..1.0, y0, method: Method::Radau, jac: jac);
+/// assert(r.success() && r.njev >= 1);
+/// ```
+pub enum Jacobian {
+    /// Forward differences, `n` evaluations of `f` each.
+    Approx,
+    /// A function giving the `n x n` matrix `J[i, j] = df_i / dy_j`.
+    Exact(fn(f64, Vector<f64>) -> Matrix<f64>),
+    /// A constant matrix (a linear problem); never recomputed.
+    Constant(Matrix<f64>),
+}
+
+fn bad(what: str) -> OdeError { OdeError::BadArgument { what: what } }
+
+/// Solves `y' = f(t, y)`, `y(span.start) = y0` over `span`, which may
+/// run backwards (`10.0..0.0`).
+///
+/// The error test is per component, `|err_i| <= atol_i + rtol |y_i|`,
+/// in the RMS norm: `rtol` (floored at `100 eps`) and `atol` (one value
+/// or one per component) say how many digits to keep and below what
+/// size a component counts as zero. Options:
+///
+/// - `t_eval`: output only at these times (inside `span`, ordered along
+///   it), read off the dense output; otherwise at every step end.
+/// - `dense`: keep the dense output in `sol` (on by default; `false`
+///   saves memory and DOP853's three extra stages per step).
+/// - `events`: functions whose zeros to locate (`Event`).
+/// - `max_step`, `first_step`: bound the step size, fix the first one
+///   (`0` lets the method choose).
+/// - `jac`: the Jacobian for `Radau`, `Bdf`, `Rodas` and `Auto`.
+///
+/// A run that cannot finish returns what it has with a failing
+/// `status`; bad input throws `OdeError`.
+///
+/// ```nabi
+/// use ode::Method;
+/// use core::array::Vector;
+///
+/// // Logistic growth, y' = y (1 - y): y(t) = 1 / (1 + 9 e^-t) from 0.1.
+/// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y .* (1.0 .- y) }, 0.0..5.0, [0.1], method: Method::Dop853, rtol: 1e-10, atol: 1e-12);
+/// assert((r.last()[0] - 1.0 / (1.0 + 9.0 * (-5.0f64).exp())).abs() < 1e-10);
+///
+/// // Backwards from t = 1.
+/// let y1: Vector<f64> = [1.0f64.exp()];
+/// let b = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 1.0..0.0, y1, rtol: 1e-9, atol: 1e-12);
+/// assert((b.last()[0] - 1.0).abs() < 1e-8);
+/// ```
+pub fn solve_ivp<Y: AsVector<f64>>(
+    f: fn(f64, Vector<f64>) -> Vector<f64>,
+    span: Range<f64>,
+    y0: Y,
+    method: Method = Method::Rk45,
+    rtol: f64 = 1e-3,
+    atol: f64 | Vector<f64> = 1e-6,
+    t_eval: Vector<f64> | none = none,
+    dense: bool = true,
+    events: List<Event> = [],
+    max_step: f64 = f64::INFINITY,
+    first_step: f64 = 0.0,
+    jac: Jacobian = Jacobian::Approx,
+) throws (OdeError) -> Solution {
+    let y0: Vector<f64> = y0.as_vector();
+    let (t0, t1) = (span.start, span.end);
+    if !t0.is_finite() || !t1.is_finite() { throw bad(f"the span {t0}..{t1} must have finite ends; integrate to a large finite time instead"); }
+    let n = y0.len();
+    let y = y0.to_list();
+    if !finite(y) { throw OdeError::NotFinite { what: "y0" }; }
+    if !(rtol > 0.0) || !rtol.is_finite() { throw bad(f"rtol must be positive and finite, got {rtol}; pass a relative tolerance such as `rtol: 1e-6`"); }
+    let atols = match atol {
+        a: f64 => List::filled(n, a),
+        v: Vector<f64> => {
+            if v.len() != n { throw OdeError::LengthMismatch { what: f"atol has {v.len()} values for {n} components; pass one value, or one per component" }; }
+            v.to_list()
+        },
+    };
+    for a in atols {
+        if !(a >= 0.0) || !a.is_finite() { throw bad(f"atol must be zero or positive and finite, got {a}; pass an absolute tolerance such as `atol: 1e-9`"); }
+    }
+    if !(max_step > 0.0) { throw bad(f"max_step must be positive, got {max_step}; leave it out for no bound"); }
+    if !(first_step >= 0.0) || first_step > (t1 - t0).abs() { throw bad(f"first_step must lie in 0..={(t1 - t0).abs()} (the span length), got {first_step}; leave it out to let the method choose"); }
+    match jac {
+        Jacobian::Constant(m) => {
+            let s = m.shape();
+            if s[0] != n || s[1] != n { throw OdeError::LengthMismatch { what: f"the constant Jacobian is {s[0]} x {s[1]} for {n} components; pass the n x n matrix of df_i/dy_j" }; }
+        },
+        _ => {},
+    }
+    let dir = if t1 >= t0 { 1.0 } else { -1.0 };
+    let (te, use_te) = match t_eval {
+        v: Vector<f64> => (v.to_list(), true),
+        none => ([], false),
+    };
+    let (lo, hi) = (t0.min(t1), t0.max(t1));
+    for i in 0..te.len() {
+        if !(te[i] >= lo && te[i] <= hi) { throw bad(f"t_eval[{i}] = {te[i]} lies outside the span {t0}..{t1}; keep the output times inside it"); }
+        if i > 0 && dir * (te[i] - te[i - 1]) < 0.0 { throw bad(f"t_eval must be ordered along the span ({t0}..{t1}), but t_eval[{i}] = {te[i]} goes back; sort it"); }
+    }
+    let sys = System {
+        f: f, n: n, rtol: rtol.max(100.0 * f64::EPSILON), atol: atols, jac: jac,
+        t_bound: t1, dir: dir, max_step: max_step, nfev: 0, njev: 0, nlu: 0,
+    };
+    let f0 = try sys.eval(t0, y);
+    if !finite(f0) { throw OdeError::NotFinite { what: "f(t0, y0)" }; }
+    let run = Run { t0: t0, y0: y, te: te, use_te: use_te, dense: dense, events: events };
+    if t0 == t1 { return finish_empty(run, sys); }
+    match method {
+        Method::Radau => {
+            let s = try Radau::new(ref sys, t0, y, f0, first_step);
+            try drive(ref s, ref sys, run, [])
+        },
+        Method::Bdf => {
+            let s = try Bdf::new(ref sys, t0, y, f0, first_step);
+            try drive(ref s, ref sys, run, [])
+        },
+        Method::Rodas => {
+            let s = try Rodas::new(ref sys, t0, y, f0, first_step);
+            try drive(ref s, ref sys, run, [])
+        },
+        Method::Auto => {
+            let s = try Auto::new(ref sys, t0, y, f0, first_step);
+            let r = try drive(ref s, ref sys, run, []);
+            r.switches = s.switches;
+            r
+        },
+        _ => {
+            let s = try Rk::new(method, ref sys, t0, y, f0, first_step);
+            try drive(ref s, ref sys, run, [])
+        },
+    }
+}
+
+/// The output requests of a run.
+struct Run {
+    t0: f64;
+    y0: List<f64>;
+    te: List<f64>;
+    use_te: bool;
+    dense: bool;
+    events: List<Event>;
+}
+
+fn finish_empty(run: Run, sys: System) -> Solution {
+    let n = sys.n;
+    let (ts, ys): (List<f64>, List<List<f64>>) = ([], []);
+    for t in run.te {
+        ts.push(t);
+        ys.push(run.y0);
+    }
+    if !run.use_te {
+        ts.push(run.t0);
+        ys.push(run.y0);
+    }
+    let te: List<Vector<f64>> = [];
+    let ye: List<Matrix<f64>> = [];
+    for _ in run.events {
+        te.push(Array::zeros([0]));
+        ye.push(Array::zeros([0, n]));
+    }
+    Solution {
+        t: Array::from_list(ts, [ts.len()]), y: columns(ys, n), status: Status::Finished,
+        nfev: sys.nfev, njev: sys.njev, nlu: sys.nlu, steps: 0, sol: Dense::new(run.t0, run.y0),
+        t_events: te, y_events: ye, switches: [],
+    }
+}
+
+/// `n x m` matrix whose columns are the states.
+fn columns(ys: List<List<f64>>, n: usize) -> Matrix<f64> {
+    let m = ys.len();
+    let d = List::filled(n * m, 0.0);
+    for j in 0..m {
+        let c = ys[j];
+        for i in 0..n { d[i * m + j] = c[i]; }
+    }
+    Array::view_list(d, [n, m])
+}
+
+/// `hits x n` matrix of the event states.
+fn rows(ys: List<List<f64>>, n: usize) -> Matrix<f64> {
+    let m = ys.len();
+    let d = List::filled(n * m, 0.0);
+    for j in 0..m {
+        let c = ys[j];
+        for i in 0..n { d[j * n + i] = c[i]; }
+    }
+    Array::view_list(d, [m, n])
+}
+
+/// Runs `s` to the end of the span or a terminal event.
+fn drive<S: Stepper>(ref s: S, ref sys: System, run: Run, switches: List<f64>) throws (OdeError) -> Solution {
+    let n = sys.n;
+    let dir = sys.dir;
+    let (ts, ys): (List<f64>, List<List<f64>>) = ([run.t0], [run.y0]);
+    if run.use_te {
+        ts = [];
+        ys = [];
+    }
+    let ti = 0usize;
+    let ne = run.events.len();
+    let g = List::filled(ne, 0.0);
+    for k in 0..ne { g[k] = run.events[k].value(run.t0, run.y0); }
+    let et: List<List<f64>> = [];
+    let ey: List<List<List<f64>>> = [];
+    for _ in 0..ne {
+        et.push([]);
+        ey.push([]);
+    }
+    let need = run.dense || run.use_te || ne > 0;
+    let dense = Dense::new(run.t0, run.y0);
+    let status = Status::Finished;
+    let steps = 0usize;
+    loop {
+        let t_old = s.time();
+        if dir * (t_old - sys.t_bound) >= 0.0 { break; }
+        let o = try s.advance(ref sys);
+        if o != Outcome::Accepted {
+            status = if o == Outcome::NotFinite { Status::NotFinite } else { Status::StepTooSmall };
+            break;
+        }
+        steps += 1;
+        let t = s.time();
+        let y = s.state();
+        if !need {
+            ts.push(t);
+            ys.push(y);
+            continue;
+        }
+        let p = try s.interpolant(ref sys);
+        let stop = false;
+        if ne > 0 {
+            // Zeros in this step, in time order; a terminal one ends it.
+            let hits: List<(f64, usize)> = [];
+            let gn = List::filled(ne, 0.0);
+            for k in 0..ne {
+                let ev = run.events[k];
+                gn[k] = ev.value(t, y);
+                if ev.crosses(g[k], gn[k]) { hits.push((ev.root(p, n, t_old, t, g[k], gn[k]), k)); }
+            }
+            hits.sort_by(|a: (f64, usize), b: (f64, usize)| -> core::cmp::Ordering { (dir * a.0).total_cmp(dir * b.0) });
+            let v = List::filled(n, 0.0);
+            for h in hits {
+                let (tr, k) = h;
+                p.eval_into(tr, v);
+                et[k].push(tr);
+                ey[k].push(v.clone());
+                if run.events[k].terminal {
+                    stop = true;
+                    t = tr;
+                    y = v.clone();
+                    break;
+                }
+            }
+            g = gn;
+        }
+        if run.use_te {
+            while ti < run.te.len() && dir * (run.te[ti] - t) <= 0.0 {
+                let v = List::filled(n, 0.0);
+                p.eval_into(run.te[ti], v);
+                ts.push(run.te[ti]);
+                ys.push(v);
+                ti += 1;
+            }
+        } else {
+            ts.push(t);
+            ys.push(y);
+        }
+        if run.dense { dense.push(t, p); }
+        if stop {
+            status = Status::Event;
+            break;
+        }
+    }
+    let te: List<Vector<f64>> = [];
+    let ye: List<Matrix<f64>> = [];
+    for k in 0..ne {
+        te.push(Array::from_list(et[k], [et[k].len()]));
+        ye.push(rows(ey[k], n));
+    }
+    Solution {
+        t: Array::from_list(ts, [ts.len()]), y: columns(ys, n), status: status,
+        nfev: sys.nfev, njev: sys.njev, nlu: sys.nlu, steps: steps, sol: dense,
+        t_events: te, y_events: ye, switches: switches,
+    }
+}

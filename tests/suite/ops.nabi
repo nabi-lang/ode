@@ -1,0 +1,63 @@
+use pkg::Fixed;
+use pkg::ops::{Advance, Flow};
+use pkg::tests::suite::{close, expect};
+use core::array::Vector;
+
+#[test]
+fn strang_is_verlet() {
+    // K(h/2) D(h) K(h/2) on [q, p] is one velocity Verlet step.
+    let (force, q0, p0, _) = pkg::problems::kepler(0.4);
+    let h = 0.01;
+    let kick = Flow::kick(force, 2, h);
+    let drift = Flow::drift(|p: Vector<f64>| -> Vector<f64> { p }, 2, h);
+    let verlet = (0.5 * kick) ∘ drift ∘ (0.5 * kick);
+    let y = verlet ** 500 ⊳ [q0[0], q0[1], p0[0], p0[1]];
+    let o = try! pkg::verlet(force, q0, p0, 0.0..5.0, 500);
+    for i in 0..2 {
+        close(y[i], o.last_q()[i], 1e-12, "q");
+        close(y[2 + i], o.last_p()[i], 1e-12, "p");
+    }
+}
+
+#[test]
+fn yoshida_by_composition() {
+    let (force, q0, p0, _) = pkg::problems::kepler(0.4);
+    let h = 0.02;
+    let c = 2.0f64.cbrt();
+    let (w1, w0) = (1.0 / (2.0 - c), -c / (2.0 - c));
+    let kick = Flow::kick(force, 2, h);
+    let drift = Flow::drift(|p: Vector<f64>| -> Vector<f64> { p }, 2, h);
+    let v = (0.5 * kick) ∘ drift ∘ (0.5 * kick);
+    let y4 = (w1 * v) ∘ (w0 * v) ∘ (w1 * v);
+    let y = y4 ** 250 ⊳ [q0[0], q0[1], p0[0], p0[1]];
+    let o = try! pkg::yoshida4(force, q0, p0, 0.0..5.0, 250);
+    close(y[0], o.last_q()[0], 1e-11, "Yoshida q");
+    close(y[3], o.last_p()[1], 1e-11, "Yoshida p");
+}
+
+#[test]
+fn precedence() {
+    let add = Flow::new(|h: f64, y: Vector<f64>| -> Vector<f64> { y .+ h }, 1.0);
+    let dbl = Flow::new(|h: f64, y: Vector<f64>| -> Vector<f64> { y .* (1.0 + h) }, 1.0);
+    let y: Vector<f64> = [1.0];
+    // ∘ applies the right one first and binds tighter than ⊳.
+    expect((add ∘ dbl ⊳ y)[0] == 3.0 && (dbl ∘ add ⊳ y)[0] == 4.0, "composition order");
+    // ** binds tighter than ∘: add ∘ (dbl ** 2).
+    expect((add ∘ dbl ** 2 ⊳ y)[0] == 5.0, "power before composition");
+    // c * a scales the step; * and ⊳ share a level, left to right.
+    expect((3.0 * add ⊳ y)[0] == 4.0, "scaled step");
+    let traj = (0.5 * dbl).run(y, 2);
+    expect(traj[0, 2] == 2.25, "run");
+}
+
+#[test]
+fn flow_of_rk4() {
+    let phi = Flow::of(|y: Vector<f64>| -> Vector<f64> { [y[1], -y[0]] }, 0.01, Fixed::Rk4);
+    let y0: Vector<f64> = [0.0, 1.0];
+    let y = phi ** 100 ⊳ y0;
+    close(y[0], 1.0f64.sin(), 1e-10, "flow of RK4");
+    let r = try! pkg::rk4(|t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0]] }, 0.0..1.0, y0, 100);
+    close(y[1], r.last()[1], 1e-14, "same as rk4");
+    let e = Flow::of(|y: Vector<f64>| -> Vector<f64> { y }, 0.1, Fixed::Euler);
+    close((e ** 10 ⊳ [1.0])[0], 1.1f64.powi(10), 1e-14, "Euler flow");
+}

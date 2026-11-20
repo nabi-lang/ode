@@ -1,0 +1,101 @@
+// Automatic stiff / non-stiff switching in the spirit of LSODA (Petzold
+// 1983): start with Dormand-Prince 5(4) and watch Hairer's stiffness
+// estimate |h lambda| from its last two stages (Solving ODEs II, IV.2);
+// after 15 accepted steps with |h lambda| > 2.5 the problem is stiff
+// and the run goes on with BDF. Hairer's DOPRI5 uses 3.25, the edge of
+// the stability region (3.3 on the negative real axis); an RK45 run held
+// at that edge by stability rarely shows more than 3, so the lower bound
+// catches it within a few dozen steps.
+// In the BDF phase, every 10th step bounds the spectral radius rho by
+// the infinity norm of the Jacobian in use; when an explicit step of the
+// current size would be stable (h rho <= 3) three checks running, it
+// switches back. Each switch restarts the new method from the current
+// point with the current step size.
+
+use pkg::dense::Piece;
+use pkg::ivp::bdf::Bdf;
+use pkg::ivp::rk::Rk;
+use pkg::ivp::system::{Outcome, Stepper, System};
+use pkg::{Method, OdeError};
+
+const STIFF_RATIO: f64 = 2.5;
+const STIFF_STEPS: usize = 15;
+const CALM_STEPS: usize = 6;
+const CHECK_EVERY: usize = 10;
+const MIN_STAY: usize = 20;
+const STABLE_BOUND: f64 = 3.0;
+
+pub(pkg) struct Auto {
+    rk: Rk;
+    bdf: Bdf;
+    stiff: bool;
+    hits: usize;
+    calm: usize;
+    since: usize;
+    /// The last step's interpolant, taken before a switch can replace
+    /// the method that made it.
+    last: Piece | none;
+    pub(pkg) switches: List<f64>;
+}
+
+impl Auto {
+    pub(pkg) fn new(ref sys: System, t0: f64, y0: List<f64>, f0: List<f64>, first_step: f64) throws (OdeError) -> Auto {
+        Auto { rk: try Rk::new(Method::Rk45, ref sys, t0, y0, f0, first_step), bdf: Bdf::idle(), stiff: false, hits: 0, calm: 0, since: 0, last: none, switches: [] }
+    }
+
+    fn watch(ref self, ref sys: System) throws (OdeError) {
+        self.since += 1;
+        if !self.stiff {
+            if self.rk.stiff_ratio > STIFF_RATIO {
+                self.hits += 1;
+                self.calm = 0;
+                if self.hits >= STIFF_STEPS {
+                    self.bdf = try Bdf::new(ref sys, self.rk.t, self.rk.y, self.rk.f, self.rk.h_abs);
+                    self.stiff = true;
+                    self.switches.push(self.rk.t);
+                    self.hits = 0;
+                    self.since = 0;
+                }
+            } else {
+                self.calm += 1;
+                if self.calm >= CALM_STEPS { self.hits = 0; }
+            }
+            return;
+        }
+        if self.since < MIN_STAY || self.since % CHECK_EVERY != 0 { return; }
+        if self.bdf.h_abs * self.bdf.jac_norm(sys.n) <= STABLE_BOUND {
+            self.hits += 1;
+            if self.hits >= 3 {
+                let f = try sys.eval(self.bdf.t, self.bdf.y);
+                self.rk = try Rk::new(Method::Rk45, ref sys, self.bdf.t, self.bdf.y, f, self.bdf.h_abs);
+                self.stiff = false;
+                self.switches.push(self.bdf.t);
+                self.hits = 0;
+                self.calm = 0;
+                self.since = 0;
+            }
+        } else {
+            self.hits = 0;
+        }
+    }
+}
+
+impl Stepper for Auto {
+    fn time(self) -> f64 { if self.stiff { self.bdf.t } else { self.rk.t } }
+    fn state(self) -> List<f64> { if self.stiff { self.bdf.y } else { self.rk.y } }
+
+    fn advance(ref self, ref sys: System) throws (OdeError) -> Outcome {
+        let o = if self.stiff { try self.bdf.step(ref sys) } else { try self.rk.step(ref sys) };
+        if o != Outcome::Accepted { return o; }
+        self.last = if self.stiff { self.bdf.piece(ref sys) } else { try self.rk.piece(ref sys) };
+        try self.watch(ref sys);
+        o
+    }
+
+    fn interpolant(ref self, ref sys: System) throws (OdeError) -> Piece {
+        match self.last {
+            p: Piece => p,
+            none => try self.rk.piece(ref sys),
+        }
+    }
+}

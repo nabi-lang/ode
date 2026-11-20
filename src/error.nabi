@@ -1,0 +1,43 @@
+// The one error type of the package. Each message says what went wrong
+// and what to write instead.
+
+/// What went wrong setting up a problem. A run that starts but cannot
+/// finish (a step size too small, NaN from the right-hand side) does not
+/// throw: it returns its result with a `Status` that says why.
+///
+/// ```nabi
+/// use ode::OdeError;
+/// use core::array::Vector;
+///
+/// let y0: Vector<f64> = [1.0];
+/// let e = try {
+///     _ = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { -y }, 0.0..1.0, y0, rtol: -1.0);
+///     OdeError::NotFinite { what: "" }
+/// } catch e: OdeError { e };
+/// assert(e == OdeError::BadArgument { what: "rtol must be positive and finite, got -1; pass a relative tolerance such as `rtol: 1e-6`" });
+/// assert(f"{e}".contains("rtol"));
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub enum OdeError {
+    /// An argument is out of its range; `what` says which and what fits.
+    BadArgument { what: str; },
+    /// Two inputs that must agree in length or shape do not; `what`
+    /// names both.
+    LengthMismatch { what: str; },
+    /// An input, or a value the problem's functions gave at the start,
+    /// holds NaN or an infinity; `what` names it.
+    NotFinite { what: str; },
+}
+
+impl Display for OdeError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            OdeError::BadArgument { what } => what,
+            OdeError::LengthMismatch { what } => f"lengths do not fit: {what}",
+            OdeError::NotFinite { what } => f"{what} holds NaN or infinity; check the initial values and the right-hand side at the start",
+        };
+        try f.write_str(s)
+    }
+}
+
+impl Error for OdeError {}

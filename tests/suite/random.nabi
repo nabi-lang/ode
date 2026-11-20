@@ -1,0 +1,50 @@
+// Random stable linear systems y' = A y against y(t) = expm(A t) y0.
+
+use pkg::tests::suite::expect;
+use pkg::{Jacobian, Method};
+use core::array::{Array, Matrix, Vector};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+#[test]
+fn linear_systems_match_expm() {
+    let g = Xoshiro256PlusPlus::seed(7);
+    for trial in 0..6 {
+        let n = 2 + trial;
+        // A = -(B B^T / n + I / 2) + S, S skew: eigenvalues in the left half plane.
+        let b: Matrix<f64> = Array::from_fn([n, n], |ix: [usize; 2]| -> f64 { 0.0 });
+        let s: Matrix<f64> = Array::zeros([n, n]);
+        for i in 0..n {
+            for j in 0..n {
+                b[i, j] = g.uniform(-1.0, 1.0);
+            }
+        }
+        for i in 0..n {
+            for j in 0..i {
+                let v = g.uniform(-2.0, 2.0);
+                s[i, j] = v;
+                s[j, i] = -v;
+            }
+        }
+        let a: Matrix<f64> = Array::zeros([n, n]);
+        for i in 0..n {
+            for j in 0..n {
+                let acc = 0.0;
+                for k in 0..n { acc += b[i, k] * b[j, k]; }
+                a[i, j] = -acc / (n as f64) + s[i, j] - if i == j { 0.5 } else { 0.0 };
+            }
+        }
+        let y0: Vector<f64> = Array::from_fn([n], |ix: [usize; 1]| -> f64 { (ix[0] as f64) - 1.0 });
+        let t = 2.0;
+        let at: Matrix<f64> = Array::from_fn([n, n], |ix: [usize; 2]| -> f64 { a[ix[0], ix[1]] * t });
+        let e = try! linalg::expm(at);
+        let exact = try! linalg::matvec(e, y0);
+        for m in [Method::Rk45, Method::Dop853, Method::Radau, Method::Bdf, Method::Rodas, Method::Auto] {
+            let am = a;
+            let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { try! linalg::matvec(am, y) }, 0.0..t, y0, method: m, rtol: 1e-9, atol: 1e-11, jac: Jacobian::Constant(a));
+            let y = r.last();
+            let err = 0.0;
+            for i in 0..n { err = err.max((y[i] - exact[i]).abs()); }
+            expect(err < 1e-6, f"n = {n}, {m:?}: error {err}");
+        }
+    }
+}

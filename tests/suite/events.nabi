@@ -1,0 +1,80 @@
+use pkg::tests::suite::{close, expect};
+use pkg::{Direction, Event, Method, Status};
+use core::array::Vector;
+
+const PI: f64 = 3.141592653589793;
+
+#[test]
+fn zero_crossings_of_sine() {
+    // y = sin t crosses zero at k pi; rising at even k, falling at odd.
+    let y0: Vector<f64> = [0.0, 1.0];
+    let f = |t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0]] };
+    for m in [Method::Rk45, Method::Dop853, Method::Radau, Method::Bdf, Method::Rodas] {
+        let both = Event { f: |t: f64, y: Vector<f64>| -> f64 { y[0] } };
+        let up = Event { f: |t: f64, y: Vector<f64>| -> f64 { y[0] }, direction: Direction::Rising };
+        let down = Event { f: |t: f64, y: Vector<f64>| -> f64 { y[0] }, direction: Direction::Falling };
+        let r = try! pkg::solve_ivp(f, 0.0..10.0, y0, method: m, rtol: 1e-10, atol: 1e-12, events: [both, up, down]);
+        expect(r.status == Status::Finished, f"{m:?} not terminal");
+        // The zero at t = 0 is the start, not a crossing.
+        expect(r.t_events[0].len() == 3, f"{m:?} both: {r.t_events[0]:?}");
+        expect(r.t_events[1].len() == 1 && r.t_events[2].len() == 2, f"{m:?} directions");
+        for k in 0..3 { close(r.t_events[0][k], ((k + 1) as f64) * PI, 2e-8, f"{m:?} root {k}"); }
+        close(r.t_events[1][0], 2.0 * PI, 2e-8, f"{m:?} rising root");
+        expect(r.y_events[0].shape() == [3, 2], f"{m:?} event states shape");
+        close(r.y_events[0][0, 1], -1.0, 1e-7, f"{m:?} y' at pi");
+    }
+}
+
+#[test]
+fn terminal_event_truncates() {
+    // Free fall from 100 m: lands at sqrt(200 / g).
+    let g = 9.81;
+    let y0: Vector<f64> = [100.0, 0.0];
+    let land = Event { f: |t: f64, y: Vector<f64>| -> f64 { y[0] }, terminal: true };
+    let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -g] }, 0.0..100.0, y0, events: [land], t_eval: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 50.0]);
+    let tl = (200.0 / g).sqrt();
+    expect(r.status == Status::Event && r.success(), "terminal status");
+    close(r.t_events[0][0], tl, 1e-10, "landing time");
+    close(r.y_events[0][0, 0], 0.0, 1e-9, "on the ground");
+    expect(r.t.len() == 5 && r.t[4] == 4.0, f"t_eval cut at the event: {r.t:?}");
+    let s = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -g] }, 0.0..100.0, y0, events: [land]);
+    close(s.t[s.t.len() - 1], tl, 1e-10, "last output time is the event");
+    close(s.sol.span().end, tl, 1e-10, "dense output ends at the event");
+}
+
+#[test]
+fn bouncing_ball_by_restarts() {
+    // Each terminal event restarts with the velocity reversed and damped.
+    let g = 9.81;
+    let t = 0.0;
+    let y0: Vector<f64> = [10.0, 0.0];
+    let hits: List<f64> = [];
+    for _ in 0..4 {
+        let ground = Event { f: |t: f64, y: Vector<f64>| -> f64 { y[0] }, terminal: true, direction: Direction::Falling };
+        let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -g] }, t..t + 20.0, y0, events: [ground], rtol: 1e-10, atol: 1e-12);
+        t = r.t_events[0][0];
+        hits.push(t);
+        y0 = [0.0, -0.5 * r.y_events[0][0, 1]];
+    }
+    // Exact: first fall sqrt(2 h / g), then flights 2 v / g with v halving.
+    let v = (2.0 * g * 10.0).sqrt();
+    let want = (2.0 * 10.0 / g).sqrt();
+    for k in 0..4 {
+        close(hits[k], want, 1e-8, f"bounce {k}");
+        v *= 0.5;
+        want += 2.0 * v / g;
+    }
+}
+
+#[test]
+fn two_events_in_one_step() {
+    // Large steps (y' = 1 is integrated exactly) see both zeros in one
+    // step and report them in time order.
+    let y0: Vector<f64> = [0.0];
+    let a = Event { f: |t: f64, y: Vector<f64>| -> f64 { y[0] - 0.7 } };
+    let b = Event { f: |t: f64, y: Vector<f64>| -> f64 { y[0] - 0.3 }, terminal: true };
+    let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [1.0] }, 0.0..1.0, y0, events: [a, b], first_step: 1.0);
+    close(r.t_events[1][0], 0.3, 1e-14, "terminal zero");
+    expect(r.t_events[0].len() == 0, "the later zero is past the terminal one");
+    expect(r.status == Status::Event, "stopped");
+}

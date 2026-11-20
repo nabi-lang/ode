@@ -1,0 +1,20 @@
+use core::array::{Array, Vector};
+
+#[test]
+fn decay() {
+    let y0: Vector<f64> = [1.0];
+    let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { -y }, 0.0..1.0, y0, rtol: 1e-8, atol: 1e-10);
+    println(f"{r.last()[0] - (-1.0f64).exp()} {r.nfev} {r.steps}");
+}
+
+#[test]
+fn dense_is_callable() {
+    let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { -y }, 0.0..2.0, [1.0], rtol: 1e-8, atol: 1e-10);
+    let sol = r.sol;
+    let ts: Vector<f64> = [0.25, 1.0, 1.75];
+    expect(sol(1.0) == sol.at(1.0) && sol(ts) == sol.eval(ts), "sol(t), sol(ts)");
+    expect((ts |> sol) == sol.eval(ts), "ts |> sol");
+    expect(sol([0.25, 1.0, 1.75]) == sol(ts) && (r.sol)(1.0) == sol(1.0), "a list literal, a field call");
+    let te = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { -y }, 0.0..2.0, [1.0], t_eval: [0.0, 1.0]);
+    expect(te.t.len() == 2, "t_eval");
+}

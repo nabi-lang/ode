@@ -1,0 +1,103 @@
+// LU with partial pivoting of a band matrix (LAPACK's xGBTF2 / xGBTRS):
+// column-major band storage with `kl` extra rows for the fill-in that
+// row swaps bring. O(N kl (kl + ku)) to factor, O(N (2 kl + ku)) per
+// solve.
+
+pub(pkg) struct Band {
+    pub(pkg) n: usize;
+    pub(pkg) kl: usize;
+    pub(pkg) ku: usize;
+    /// `ldab x n`, `A[i, j]` at `j * ldab + kl + ku + i - j`.
+    pub(pkg) ab: List<f64>;
+    piv: List<usize>;
+    /// A zero pivot was met.
+    pub(pkg) singular: bool;
+}
+
+impl Band {
+    pub(pkg) fn zeros(n: usize, kl: usize, ku: usize) -> Band {
+        let ldab = 2 * kl + ku + 1;
+        Band { n: n, kl: kl, ku: ku, ab: List::filled(ldab * n, 0.0), piv: List::filled(n, 0), singular: false }
+    }
+
+    /// Adds `v` to `A[i, j]` (inside the band).
+    pub(pkg) fn add(ref self, i: usize, j: usize, v: f64) {
+        let ldab = 2 * self.kl + self.ku + 1;
+        self.ab[j * ldab + self.kl + self.ku + i - j] += v;
+    }
+
+    /// Factors in place.
+    pub(pkg) fn factor(ref self) {
+        let (n, kl, ku) = (self.n, self.kl, self.ku);
+        let ldab = 2 * kl + ku + 1;
+        let kv = kl + ku;
+        let ju = 0usize;
+        for j in 0..n {
+            let km = kl.min(n - 1 - j);
+            let jp = 0usize;
+            let best = self.ab[j * ldab + kv].abs();
+            for i in 1..km + 1 {
+                let v = self.ab[j * ldab + kv + i].abs();
+                if v > best {
+                    best = v;
+                    jp = i;
+                }
+            }
+            self.piv[j] = j + jp;
+            if best == 0.0 {
+                self.singular = true;
+                continue;
+            }
+            ju = ju.max((j + ku + jp).min(n - 1));
+            if jp != 0 {
+                // Swap rows j and j + jp over columns j..=ju.
+                for c in j..ju + 1 {
+                    let a = c * ldab + kv + j - c;
+                    let b = a + jp;
+                    let t = self.ab[a];
+                    self.ab[a] = self.ab[b];
+                    self.ab[b] = t;
+                }
+            }
+            if km > 0 {
+                let d = 1.0 / self.ab[j * ldab + kv];
+                for i in 1..km + 1 { self.ab[j * ldab + kv + i] *= d; }
+                for c in j + 1..ju + 1 {
+                    let u = self.ab[c * ldab + kv + j - c];
+                    if u == 0.0 { continue; }
+                    for i in 1..km + 1 { self.ab[c * ldab + kv + j + i - c] -= self.ab[j * ldab + kv + i] * u; }
+                }
+            }
+        }
+    }
+
+    /// `x` with `A x = b`, after `factor`.
+    pub(pkg) fn solve(self, b: List<f64>) -> List<f64> {
+        let (n, kl, ku) = (self.n, self.kl, self.ku);
+        let ldab = 2 * kl + ku + 1;
+        let kv = kl + ku;
+        let x = b.clone();
+        if kl > 0 {
+            for j in 0..n - 1 {
+                let lm = kl.min(n - 1 - j);
+                let l = self.piv[j];
+                if l != j {
+                    let t = x[l];
+                    x[l] = x[j];
+                    x[j] = t;
+                }
+                let xj = x[j];
+                for i in 1..lm + 1 { x[j + i] -= self.ab[j * ldab + kv + i] * xj; }
+            }
+        }
+        let j = n;
+        while j > 0 {
+            j -= 1;
+            x[j] /= self.ab[j * ldab + kv];
+            let xj = x[j];
+            let lo = if j > kv { j - kv } else { 0 };
+            for i in lo..j { x[i] -= self.ab[j * ldab + kv + i - j] * xj; }
+        }
+        x
+    }
+}

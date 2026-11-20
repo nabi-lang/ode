@@ -1,0 +1,121 @@
+// What an initial value run gives back.
+
+use pkg::Dense;
+use core::array::{Array, Matrix, Vector};
+
+/// Why a run stopped.
+///
+/// ```nabi
+/// use ode::Status;
+///
+/// assert(Status::Finished.success() && Status::Event.success());
+/// assert(!Status::StepTooSmall.success());
+/// assert(f"{Status::StepTooSmall}".contains("rtol"));
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Status {
+    /// The end of the span was reached.
+    Finished,
+    /// A terminal event stopped the run.
+    Event,
+    /// The step size the error test asked for fell below the spacing of
+    /// floats at `t`.
+    StepTooSmall,
+    /// The right-hand side gave NaN or infinity, and no smaller step
+    /// avoided it.
+    NotFinite,
+}
+
+impl Status {
+    /// Whether the run ended as asked (the end of the span or a
+    /// terminal event).
+    ///
+    /// ```nabi
+    /// assert(ode::Status::Finished.success());
+    /// ```
+    pub fn success(self) -> bool { self == Status::Finished || self == Status::Event }
+}
+
+impl Display for Status {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            Status::Finished => "reached the end of the span",
+            Status::Event => "a terminal event stopped the run",
+            Status::StepTooSmall => "the step size fell below the float spacing at t; the problem may be stiff (use `Method::Radau`, `Method::Bdf` or `Method::Auto`), singular there, or need a looser rtol",
+            Status::NotFinite => "the right-hand side gave NaN or infinity; check f near the last t, or bound the solution with an event",
+        };
+        try f.write_str(s)
+    }
+}
+
+/// The result of `solve_ivp`.
+///
+/// `t` and `y` hold every step end (or the `t_eval` times), the state as
+/// columns: `y[i, j]` is component `i` at `t[j]`. `sol` is the dense
+/// output. `t_events[k]` and `y_events[k]` hold the zeros of event `k`
+/// (`y_events[k]` is `hits x n`).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let y0: Vector<f64> = [2.0];
+/// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y .* -0.5 }, 0.0..10.0, y0, t_eval: [0.0, 5.0, 10.0]);
+/// assert(r.status.success() && r.t.len() == 3 && r.y.shape() == [1, 3]);
+/// assert((r.y[0, 2] - 2.0 * (-5.0f64).exp()).abs() < 1e-3);
+/// assert(r.nfev > 0 && r.njev == 0);
+/// ```
+#[derive(Clone)]
+pub struct Solution {
+    /// Output times.
+    pub t: Vector<f64>;
+    /// The state at `t`, shape `[n, t.len()]`.
+    pub y: Matrix<f64>;
+    /// Why the run stopped.
+    pub status: Status;
+    /// Evaluations of the right-hand side, finite-difference Jacobians
+    /// included.
+    pub nfev: usize;
+    /// Jacobian evaluations.
+    pub njev: usize;
+    /// LU factorizations.
+    pub nlu: usize;
+    /// Accepted steps.
+    pub steps: usize;
+    /// The dense output (empty with `dense: false`).
+    pub sol: Dense;
+    /// The times of each event's zeros.
+    pub t_events: List<Vector<f64>>;
+    /// The states at each event's zeros, `hits x n`.
+    pub y_events: List<Matrix<f64>>;
+    /// `Method::Auto` only: the times it changed method, the first to
+    /// the stiff one, alternating after.
+    pub switches: List<f64>;
+}
+
+impl Solution {
+    /// Whether the run ended as asked (`status.success()`).
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let y0: Vector<f64> = [1.0];
+    /// assert((try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 0.0..1.0, y0)).success());
+    /// ```
+    pub fn success(self) -> bool { self.status.success() }
+
+    /// The state at the last output time.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let y0: Vector<f64> = [1.0, 0.0];
+    /// let r = try ode::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [0.0, 1.0] }, 0.0..2.0, y0);
+    /// let y = r.last();
+    /// assert(y[0] == 1.0 && (y[1] - 2.0).abs() < 1e-14);
+    /// ```
+    pub fn last(self) -> Vector<f64> {
+        let s = self.y.shape();
+        if s[1] == 0 { return Array::zeros([s[0]]); }
+        self.y[:, s[1] - 1].copy()
+    }
+}

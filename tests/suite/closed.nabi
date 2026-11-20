@@ -1,0 +1,136 @@
+use pkg::Method;
+use pkg::tests::suite::{close, expect, rel};
+use core::array::{Array, Vector};
+
+const ALL: [Method; 7] = [Method::Rk23, Method::Rk45, Method::Dop853, Method::Radau, Method::Bdf, Method::Rodas, Method::Auto];
+
+#[test]
+fn decay_all_methods() {
+    let y0: Vector<f64> = [2.0, -1.0];
+    for m in ALL {
+        let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [-0.5 * y[0], -3.0 * y[1]] }, 0.0..4.0, y0, method: m, rtol: 1e-9, atol: 1e-12);
+        expect(r.status == pkg::Status::Finished, f"{m:?} finished");
+        let y = r.last();
+        rel(y[0], 2.0 * (-2.0f64).exp(), 2e-7, 1e-12, f"{m:?} decay y0");
+        rel(y[1], -(-12.0f64).exp(), 1e-5, 1e-9, f"{m:?} decay y1");
+        expect(r.t[0] == 0.0 && r.t[r.t.len() - 1] == 4.0, f"{m:?} ends");
+        expect(r.y.shape() == [2, r.t.len()] && r.steps + 1 == r.t.len(), f"{m:?} shapes");
+    }
+}
+
+#[test]
+fn oscillator_all_methods() {
+    let y0: Vector<f64> = [0.0, 1.0];
+    for m in ALL {
+        let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -y[0]] }, 0.0..10.0, y0, method: m, rtol: 1e-10, atol: 1e-12);
+        let y = r.last();
+        let tol = if m == Method::Rk23 || m == Method::Bdf { 1e-6 } else { 1e-7 };
+        close(y[0], 10.0f64.sin(), tol, f"{m:?} sin");
+        close(y[1], 10.0f64.cos(), tol, f"{m:?} cos");
+        // Dense output between steps.
+        for i in 0..21 {
+            let t = 0.5 * (i as f64) + 0.013;
+            let v = r.sol.at(t);
+            close(v[0], t.sin(), 10.0 * tol, f"{m:?} dense at {t}");
+        }
+    }
+}
+
+#[test]
+fn logistic_closed_form() {
+    // y' = r y (1 - y / k), y = k / (1 + (k / y0 - 1) e^(-r t)).
+    let (rate, k, y00) = (1.5, 10.0, 0.5);
+    let y0: Vector<f64> = [y00];
+    let exact = |t: f64| -> f64 { k / (1.0 + (k / y00 - 1.0) * (-rate * t).exp()) };
+    for m in ALL {
+        let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [rate * y[0] * (1.0 - y[0] / k)] }, 0.0..8.0, y0, method: m, rtol: 1e-10, atol: 1e-10, t_eval: [0.0, 1.0, 2.5, 8.0]);
+        expect(r.t.len() == 4 && r.y.shape() == [1, 4], f"{m:?} t_eval shape");
+        for j in 0..4 { rel(r.y[0, j], exact(r.t[j]), 1e-7, 1.0, f"{m:?} logistic at {r.t[j]}"); }
+    }
+}
+
+#[test]
+fn backwards() {
+    let y1: Vector<f64> = [1.0f64.exp()];
+    for m in ALL {
+        let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 1.0..-1.0, y1, method: m, rtol: 1e-10, atol: 1e-12, t_eval: [1.0, 0.0, -1.0]);
+        expect(r.success(), f"{m:?} backwards success");
+        rel(r.y[0, 1], 1.0, 1e-7, 1.0, f"{m:?} back at 0");
+        rel(r.y[0, 2], (-1.0f64).exp(), 1e-7, 1.0, f"{m:?} back at -1");
+        rel(r.sol.at(0.5)[0], 0.5f64.exp(), 1e-6, 1.0, f"{m:?} dense backwards");
+    }
+}
+
+#[test]
+fn time_dependent() {
+    // y' = cos t, y = sin t; y' = 2 t: exact for every method of order >= 2.
+    let y0: Vector<f64> = [0.0, 0.0];
+    for m in ALL {
+        let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [t.cos(), 2.0 * t] }, 0.0..3.0, y0, method: m, rtol: 1e-10, atol: 1e-12);
+        close(r.last()[0], 3.0f64.sin(), 1e-7, f"{m:?} sin t");
+        close(r.last()[1], 9.0, 1e-7, f"{m:?} t^2");
+    }
+}
+
+#[test]
+fn per_component_atol_and_options() {
+    let y0: Vector<f64> = [1.0, 1e-8];
+    let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [-y[0], -y[1]] }, 0.0..1.0, y0, atol: [1e-6, 1e-14], rtol: 1e-6);
+    rel(r.last()[1], 1e-8 * (-1.0f64).exp(), 1e-4, 1e-20, "small component kept by its atol");
+    let s = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [-y[0], -y[1]] }, 0.0..1.0, y0, max_step: 0.01);
+    expect(s.steps >= 100, f"max_step bounds the steps: {s.steps}");
+    let u = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [-y[0], -y[1]] }, 0.0..1.0, y0, first_step: 1e-4);
+    expect(u.t[1] == 1e-4, "first_step taken");
+    let d = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [-y[0], -y[1]] }, 0.0..1.0, y0, dense: false);
+    expect(d.sol.steps() == 0 && d.t.len() == d.steps + 1, "no dense output");
+}
+
+#[test]
+fn zero_span_and_empty_state() {
+    let y0: Vector<f64> = [3.0];
+    let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 2.0..2.0, y0);
+    expect(r.success() && r.t.len() == 1 && r.y[0, 0] == 3.0, "zero span");
+    expect(r.sol.at(5.0)[0] == 3.0, "empty dense output holds y0");
+    let e: Vector<f64> = Array::zeros([0]);
+    let s = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y }, 0.0..1.0, e);
+    expect(s.success() && s.y.shape()[0] == 0, "no unknowns");
+}
+
+#[test]
+fn not_finite_status() {
+    // A blow-up at t = 1: y' = y^2, y(0) = 1, y = 1 / (1 - t).
+    let y0: Vector<f64> = [1.0];
+    for m in [Method::Rk45, Method::Radau, Method::Bdf] {
+        let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { y .* y }, 0.0..2.0, y0, method: m);
+        expect(!r.success(), f"{m:?} stops before the singularity");
+        let tl = r.t[r.t.len() - 1];
+        expect(tl < 1.001 && tl > 0.99, f"{m:?} stopped near t = 1 (at {tl}, {r.status:?})");
+    }
+    let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { if t > 0.5 { [f64::NAN] } else { y } }, 0.0..1.0, y0);
+    expect(r.status == pkg::Status::NotFinite, f"NaN reported: {r.status:?}");
+}
+
+#[test]
+fn component_and_eval() {
+    let y0: Vector<f64> = [1.0, 0.0];
+    let r = try! pkg::solve_ivp(|t: f64, y: Vector<f64>| -> Vector<f64> { [-y[1], y[0]] }, 0.0..2.0, y0, method: Method::Dop853, rtol: 1e-11, atol: 1e-12);
+    let c = r.sol.component(1);
+    close(c(1.2), 1.2f64.sin(), 1e-9, "component(1)");
+    expect(r.sol.component(5)(1.0).is_nan(), "component out of range");
+    let m = r.sol.eval([0.1, 1.9]);
+    close(m[0, 1], 1.9f64.cos(), 1e-9, "eval");
+    let b = r.sol.breakpoints();
+    expect(b.len() == r.sol.steps() + 1 && b[0] == 0.0, "breakpoints");
+}
+
+#[test]
+fn takes_lists_and_other_types() {
+    // y0 is any `linalg::AsVector<f64>`: a list variable, ints, f32.
+    let f = |t: f64, y: Vector<f64>| -> Vector<f64> { -y };
+    let y0: List<f64> = [1.0, 2.0];
+    let a = try! pkg::solve_ivp(f, 0.0..1.0, y0, rtol: 1e-8, atol: 1e-10);
+    let b = try! pkg::solve_ivp(f, 0.0..1.0, [1, 2], rtol: 1e-8, atol: 1e-10);
+    let c = try! pkg::solve_ivp(f, 0.0..1.0, [1f32, 2f32], rtol: 1e-8, atol: 1e-10);
+    assert(a.last().all_close(b.last()) && a.last().all_close(c.last()));
+    assert(a.last()[1].is_close(2.0 * (-1.0f64).exp(), rel: 1e-7));
+}
