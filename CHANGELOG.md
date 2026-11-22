@@ -2,7 +2,13 @@
 
 All notable changes to this package. Versions follow semver, independent of the Nabi toolchain.
 
-## 0.1.0 (unreleased)
+## 0.1.1 (2026-11-22)
+
+- The package docs start with a tutorial: a first equation, systems and
+  dense output, events, stiff equations, boundary value problems. Its
+  examples run as doc tests.
+
+## 0.1.0 (2026-11-21)
 
 First release.
 

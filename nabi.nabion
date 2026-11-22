@@ -1,6 +1,6 @@
 Package {
     name: "ode",
-    version: "0.1.0",
+    version: "0.1.1",
     nabi_version: "0.1.0",
     toolchain: "0.1",
     description: "Differential equations on core arrays: adaptive Runge-Kutta, Radau, BDF, Rosenbrock and automatic stiff switching with dense output and events, fixed-step and symplectic integrators, boundary value problems",
