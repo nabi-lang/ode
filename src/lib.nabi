@@ -2,6 +2,174 @@
 //! value solvers (explicit Runge-Kutta, Radau IIA, BDF, automatic stiff
 //! switching) with dense output and events, fixed-step and symplectic
 //! integrators, and boundary value problems by collocation.
+//!
+//! # Tutorial
+//!
+//! Many models say how a quantity changes rather than what it is: a
+//! population grows in proportion to its size, a pendulum accelerates
+//! back towards the bottom. These are ordinary differential equations,
+//! `y' = f(t, y)`, and `ode` solves them. You write `f` as a closure;
+//! the solver picks its step sizes to meet a tolerance and returns the
+//! solution at its steps and as a function you can call at any time.
+//!
+//! ## A first equation
+//!
+//! Exponential decay, `y' = -0.5 y` with `y(0) = 10`, has the exact
+//! solution `10 e^(-t/2)`. `solve_ivp` takes the right-hand side, the
+//! time span as a range and the initial state. The state is a
+//! `Vector<f64>`, even with one component.
+//!
+//! ```nabi
+//! use core::array::Vector;
+//!
+//! let f = |t: f64, y: Vector<f64>| -> Vector<f64> { y .* -0.5 };
+//! let r = try ode::solve_ivp(f, 0.0..4.0, [10.0]);
+//! println(f"{r.status:?} after {r.steps} steps, {r.nfev} evaluations");
+//! println(f"y(4) = {r.last()[0]:.6}, exact {10.0 * (-2.0f64).exp():.6}");
+//! # assert(r.status == Status::Finished);
+//! # assert(r.steps == 4 && r.nfev == 26);
+//! # assert((r.last()[0] - 1.354160).abs() < 5e-7);
+//! ```
+//!
+//! ```text
+//! Finished after 4 steps, 26 evaluations
+//! y(4) = 1.354160, exact 1.353353
+//! ```
+//!
+//! The default method is `Rk45` (Dormand-Prince) with `rtol: 1e-3`,
+//! enough for a plot. Ask for more with `rtol:` and `atol:`: the solver
+//! keeps the local error below `atol + rtol * |y|`.
+//!
+//! ## Systems and the solution as a function
+//!
+//! A pendulum: angle `θ` and angular velocity `ω`, with `θ' = ω` and
+//! `ω' = -(g / L) sin θ`. A second-order equation becomes a system of
+//! two first-order ones. `r.sol` is the dense output, a function of
+//! time, so the solution can be read anywhere on the span without
+//! re-solving.
+//!
+//! ```nabi
+//! use core::array::{Vector, linspace};
+//!
+//! let g_over_l = 9.81 / 1.0;
+//! let pendulum = |t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -g_over_l * y[0].sin()] };
+//! let r = try ode::solve_ivp(pendulum, 0.0..10.0, [1.0, 0.0], rtol: 1e-9, atol: 1e-12);
+//!
+//! let sol = r.sol;
+//! for t in [0.5, 1.0, 1.5, 2.0] {
+//!     println(f"t = {t}: angle {sol(t)[0]:>8.5} rad");
+//! }
+//! let ts: Vector<f64> = linspace(0.0, 10.0, 201);
+//! let angles = sol(ts)[0, :];
+//! println(f"{angles.len()} points for a plot, smallest {angles.min() ?? 0.0:.5}");
+//! # assert((sol(1.0)[0] + 0.98007).abs() < 5e-6);
+//! # assert((sol(2.0)[0] - 0.92079).abs() < 5e-6);
+//! # assert(angles.len() == 201);
+//! ```
+//!
+//! ```text
+//! t = 0.5: angle  0.10426 rad
+//! t = 1: angle -0.98007 rad
+//! t = 1.5: angle -0.30787 rad
+//! t = 2: angle  0.92079 rad
+//! 201 points for a plot, smallest -0.99998
+//! ```
+//!
+//! `sol(t)` at one time gives the state as a vector; at a vector of
+//! times, a matrix with one row per component, so `[0, :]` is the angle
+//! at every time.
+//!
+//! ## Events
+//!
+//! An event is a function of the state whose zero the solver finds
+//! exactly. Here a ball is thrown upwards, and the event `ground` stops
+//! the run when it lands; `t_events` holds when each event happened.
+//!
+//! ```nabi
+//! use core::array::Vector;
+//!
+//! let fall = |t: f64, y: Vector<f64>| -> Vector<f64> { [y[1], -9.81] };
+//! let ground = Event { f: |t: f64, y: Vector<f64>| -> f64 { y[0] }, direction: Direction::Falling, terminal: true };
+//! let r = try ode::solve_ivp(fall, 0.0..10.0, [0.0, 15.0], events: [ground], rtol: 1e-10);
+//! let landed = r.t_events[0][0];
+//! println(f"lands after {landed:.4} s, exact {2.0 * 15.0 / 9.81:.4} s");
+//! # assert(r.status == Status::Event);
+//! # assert((landed - 2.0 * 15.0 / 9.81).abs() < 1e-8);
+//! ```
+//!
+//! ```text
+//! lands after 3.0581 s, exact 3.0581 s
+//! ```
+//!
+//! ## Stiff equations
+//!
+//! Some systems mix very fast and very slow change, such as chemical
+//! reactions with rates many orders of magnitude apart. An explicit
+//! method like `Rk45` must take tiny steps to stay stable there, even
+//! where the solution barely moves. Implicit methods (`Radau`, `Bdf`,
+//! `Rodas`) take large steps, and `Auto` switches between the two kinds
+//! as the problem changes. Robertson's reaction is the classic test.
+//!
+//! ```nabi
+//! use core::array::Vector;
+//!
+//! let robertson = |t: f64, y: Vector<f64>| -> Vector<f64> {
+//!     [-0.04 * y[0] + 1e4 * y[1] * y[2],
+//!      0.04 * y[0] - 1e4 * y[1] * y[2] - 3e7 * y[1] * y[1],
+//!      3e7 * y[1] * y[1]]
+//! };
+//! let y0: Vector<f64> = [1.0, 0.0, 0.0];
+//! for m in [Method::Bdf, Method::Radau, Method::Auto] {
+//!     let r = try ode::solve_ivp(robertson, 0.0..1e5, y0, method: m, rtol: 1e-6, atol: 1e-10);
+//!     let y = r.last();
+//!     println(f"{m:?}: {r.steps} steps, y = [{y[0]:.4}, {y[1]:.3e}, {y[2]:.4}]");
+//! #   assert((y[0] - 0.0179).abs() < 5e-5 && (y[2] - 0.9821).abs() < 5e-5);
+//! #   assert((y[1] - 7.275e-8).abs() < 5e-11);
+//! }
+//! ```
+//!
+//! ```text
+//! Bdf: 327 steps, y = [0.0179, 7.275e-8, 0.9821]
+//! Radau: 188 steps, y = [0.0179, 7.275e-8, 0.9821]
+//! Auto: 302 steps, y = [0.0179, 7.275e-8, 0.9821]
+//! ```
+//!
+//! ## Boundary value problems
+//!
+//! Not every problem starts from a known state: a beam is fixed at both
+//! ends, a temperature is held at both sides of a wall. `solve_bvp`
+//! takes the equation, a function of both ends that is zero when the
+//! conditions hold, a mesh and a first guess. Here a cable hanging
+//! between two posts, `y'' = sqrt(1 + y'^2) / a`, with `y = 0` at both
+//! ends.
+//!
+//! ```nabi
+//! use core::array::{Array, Matrix, Vector, linspace};
+//!
+//! let a = 2.0;
+//! let cable = |x: f64, y: Vector<f64>| -> Vector<f64> { [y[1], (1.0 + y[1] * y[1]).sqrt() / a] };
+//! let ends = |ya: Vector<f64>, yb: Vector<f64>| -> Vector<f64> { [ya[0], yb[0]] };
+//! let x: Vector<f64> = linspace(-1.0, 1.0, 11);
+//! let guess: Matrix<f64> = Array::zeros([2, 11]);
+//! let b = try ode::solve_bvp(cable, ends, x, guess, tol: 1e-8);
+//!
+//! // The exact shape is a catenary: a cosh(x / a) - a cosh(1 / a).
+//! let sag = b.sol.at(0.0)[0];
+//! println(f"{b.success()}: sag at the middle {sag:.6}, exact {a - a * (1.0 / a).cosh():.6}");
+//! # assert(b.success());
+//! # assert((sag - (a - a * (1.0 / a).cosh())).abs() < 1e-6);
+//! ```
+//!
+//! ```text
+//! true: sag at the middle -0.255252, exact -0.255252
+//! ```
+//!
+//! ## What next
+//!
+//! - [`autodiff`](https://packages.nabi-lang.org/docs/autodiff/latest):
+//!   the Jacobians implicit solvers need, computed for you.
+//! - Below: fixed-step (`fixed`, `rk4`) and symplectic (`symplectic`,
+//!   `verlet`) integrators, the `Jacobian` options, every `Status`.
 
 #[cfg(feature = "ops")]
 pub mod ops;
