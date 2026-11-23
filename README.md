@@ -141,13 +141,13 @@ residual-driven refinement. The adaptive solvers follow SciPy's
 `solve_ivp` / `solve_bvp` closely and take the same number of steps on
 the same problems. Jacobians are by forward differences unless given.
 
-Not in 0.1.0: delay differential equations, sparse or banded Jacobians
+Not yet supported: delay differential equations, sparse or banded Jacobians
 for large stiff systems, a vectorized right-hand side, user Jacobians for
 `solve_bvp`, and DAEs (mass matrices).
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/ode/latest/docs
+https://docs.nabi-lang.org/packages/ode/latest
 
 ## License
 
